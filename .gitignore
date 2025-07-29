@@ -164,7 +164,7 @@ cython_debug/
 .idea/
 
 
-# 忽略大文件
+# 忽略大文件1
 *.pth
 *.mha
 resources/nnUNet_results/
