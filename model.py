@@ -13,7 +13,7 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
 from postprocess_probability_maps import postprocess_single_probability_map
 
-RESOURCE_PATH = Path("resources_3d")
+RESOURCE_PATH = Path("resources")
 
 
 class FetalAbdomenSegmentation(SegmentationAlgorithm):
@@ -33,7 +33,7 @@ class FetalAbdomenSegmentation(SegmentationAlgorithm):
         self.predictor = self.initialize_predictor()
 
     def initialize_predictor(self, task="Dataset300_ACOptimalSuboptimal",
-                             network="3d_fullres", checkpoint="checkpoint_final.pth", folds=(0,)):
+                             network="2d", checkpoint="checkpoint_final.pth", folds=(0,)):
         """
         Initializes the nnUNet predictor
         """
@@ -65,6 +65,7 @@ class FetalAbdomenSegmentation(SegmentationAlgorithm):
         """
         # ideally we would like to use predictor.predict_from_files but this docker container will be called
         # for each individual test case so that this doesn't make sense
+        print(input_img_path)
         image_np, properties = SimpleITKIO().read_images([input_img_path])
         _, probabilities = self.predictor.predict_single_npy_array(
             image_np, properties, None, None, save_probabilities)
