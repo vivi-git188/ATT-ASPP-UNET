@@ -1,0 +1,15 @@
+{
+    "cases": [
+        {
+            "id": "example-case",
+            "output": {
+                "fetal-abdomen-segmentation": {
+                    "filename": "output.mha"
+                }
+            },
+            "score": {
+                "fetal-abdomen-frame-number": 38
+            }
+        }
+    ]
+}
