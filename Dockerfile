@@ -23,12 +23,21 @@ WORKDIR /opt/app
 COPY --chown=user:user resources /opt/app/resources
 
 COPY --chown=user:user requirements.txt /opt/app/
+USER root
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0
 # You can add any Python dependencies to requirements.txt
+USER user
 RUN python -m pip install \
     --user \
     --no-cache-dir \
     --no-color \
-    --requirement /opt/app/requirements.txt
+    --requirement /opt/app/requirements.txt && \
+    pip install opencv-python numpy
+
+
+RUN pip uninstall -y numpy && pip install --no-cache-dir numpy
 
 # Copy the inference script, the postprocessing script and utils to the container
 COPY --chown=user:user inference.py /opt/app/

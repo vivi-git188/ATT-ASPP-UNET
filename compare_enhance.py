@@ -1,8 +1,12 @@
 import cv2
 import matplotlib.pyplot as plt
+from pathlib import Path
 
-original = cv2.imread("original_input.png", cv2.IMREAD_GRAYSCALE)
-enhanced = cv2.imread("enhanced_input.png", cv2.IMREAD_GRAYSCALE)
+output_dir = Path("output/images")
+original_path = output_dir / "original_input.png"
+enhanced_path = output_dir / "enhanced_input.png"
+original = cv2.imread(str(original_path), cv2.IMREAD_GRAYSCALE)
+enhanced = cv2.imread(str(enhanced_path), cv2.IMREAD_GRAYSCALE)
 
 plt.figure(figsize=(12, 5))
 

@@ -66,9 +66,24 @@ class FetalAbdomenSegmentation(SegmentationAlgorithm):
         # ideally we would like to use predictor.predict_from_files but this docker container will be called
         # for each individual test case so that this doesn't make sense
         print(input_img_path)
-        image_np, properties = SimpleITKIO().read_images([input_img_path])
+        from inference import load_image_file_as_array
+        print(f"{Path(input_img_path[0])}")
+        # 使用自定义图像加载+预处理逻辑
+        image_np = load_image_file_as_array(location=Path(input_img_path[0]))
+
+        # 模拟 properties（因为 SimpleITKIO().read_images 会返回它，但你现在自己读了）
+
+        properties = {
+            'original_size_of_raw_data':image_np.shape[1:],  # (128, H, W)
+            'spacing': [0.28, 0.28, 0.28]
+        }
+        # 推理
         _, probabilities = self.predictor.predict_single_npy_array(
             image_np, properties, None, None, save_probabilities)
+
+        # image_np, properties = SimpleITKIO().read_images([input_img_path])
+        # _, probabilities = self.predictor.predict_single_npy_array(
+        #     image_np, properties, None, None, save_probabilities)
         print("Image shape:", image_np.shape)
         print("Pixel intensity stats:", np.min(image_np), np.max(image_np), np.mean(image_np))
         return probabilities

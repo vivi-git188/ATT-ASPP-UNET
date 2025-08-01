@@ -106,38 +106,52 @@ def gamma_transform(img, gamma=1.5):
     return np.uint8(img * 255)
 
 def load_image_file_as_array(*, location):
-    # Use SimpleITK to read a file
-    input_files = glob(str(location / "*.tiff")) + \
-        glob(str(location / "*.mha"))
-    print("load_image_file_as_array")
-    result = SimpleITK.ReadImage(input_files[0])
-    array = SimpleITK.GetArrayFromImage(result)
+    """
+    读取 3-D 超声序列，对 **每一帧** 做 CLAHE + 中值滤波，
+    返回 (1, N, H, W) 的 float32 数组，取值 0-1
+    """
+    import SimpleITK, cv2, numpy as np
+    from pathlib import Path
 
-    # ----------- 添加预处理逻辑 -----------
-    # 保存原图（用于对比）
-    original_uint8 = cv2.normalize(array, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cv2.imwrite("original_input.png", original_uint8)
+    location = Path(location)
+    itk_img  = SimpleITK.ReadImage(str(location))
+    array    = SimpleITK.GetArrayFromImage(itk_img)        # (N, H, W)
+    print(f"[DEBUG] Original array shape: {array.shape}")
 
-    # ----------- 添加预处理逻辑 -----------
-    array = original_uint8.copy()
+    if array.ndim != 3:
+        raise ValueError(f"Expected 3-D image (frames, H, W), got {array.shape}")
 
-    # CLAHE（局部对比度增强）
+    # 输出文件夹，用来存几张对比图（可选）
+    out_dir = Path("/output/images")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 预先创建 CLAHE 实例
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    array = clahe.apply(array.astype(np.uint8))
 
-    # 中值滤波去 speckle 噪声
-    array = cv2.medianBlur(array, 3)
+    enhanced_stack = []
+    for i, sl in enumerate(array):             # 遍历原始每一帧
+        # 归一化到 [0,255] → uint8
+        sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        # CLAHE 局部对比度增强
+        clahe_img  = clahe.apply(sl_u8)
+        # 中值滤波去噪
+        filtered   = cv2.medianBlur(clahe_img, 3)
+        enhanced_stack.append(filtered)
 
-    # gamma 或 翻转
-    # array = gamma_transform(array)
-    # array = np.fliplr(array)
+        # 可选择性地把几帧保存出来看看
+        if i in (0, len(array)//2, len(array)-1):
+            cv2.imwrite(str(out_dir / f"frame{i:03d}_orig.png"), sl_u8)
+            cv2.imwrite(str(out_dir / f"frame{i:03d}_enh.png"), filtered)
 
-    cv2.imwrite("enhanced_input.png", array)
-    return array
+    # 重新堆叠回 3-D (N, H, W) 并归一化
+    stacked_array = np.stack(enhanced_stack, axis=0)
+    array_float   = stacked_array.astype(np.float32) / 255.0    # 0-1
 
+    # (1, N, H, W) ——nnUNet 2-D 网络的期望输入格式
+    return array_float[np.newaxis, ...]
 
     # Convert it to a Numpy array
-    return SimpleITK.GetArrayFromImage(result)
+    # return SimpleITK.GetArrayFromImage(result)
 
 # Get image file path from input folder
 
@@ -158,7 +172,7 @@ def write_array_as_image_file(*, location, array, frame_number=None):
     array = convert_2d_mask_to_3d(
         mask_2d=array,
         frame_number=frame_number,
-        number_of_frames=840,
+        number_of_frames=128,#840
     )
 
     image = SimpleITK.GetImageFromArray(array)
