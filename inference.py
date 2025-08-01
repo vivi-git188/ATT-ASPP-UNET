@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import SimpleITK
+import cv2
 
 from model import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
 # ./test
@@ -98,6 +99,11 @@ def write_json_file(*, location, content):
     with open(location, 'w') as f:
         f.write(json.dumps(content, indent=4))
 
+# gamma
+def gamma_transform(img, gamma=1.5):
+    img = img / 255.0
+    img = np.power(img, gamma)
+    return np.uint8(img * 255)
 
 def load_image_file_as_array(*, location):
     # Use SimpleITK to read a file
@@ -105,6 +111,30 @@ def load_image_file_as_array(*, location):
         glob(str(location / "*.mha"))
     print("load_image_file_as_array")
     result = SimpleITK.ReadImage(input_files[0])
+    array = SimpleITK.GetArrayFromImage(result)
+
+    # ----------- 添加预处理逻辑 -----------
+    # 保存原图（用于对比）
+    original_uint8 = cv2.normalize(array, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cv2.imwrite("original_input.png", original_uint8)
+
+    # ----------- 添加预处理逻辑 -----------
+    array = original_uint8.copy()
+
+    # CLAHE（局部对比度增强）
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    array = clahe.apply(array.astype(np.uint8))
+
+    # 中值滤波去 speckle 噪声
+    array = cv2.medianBlur(array, 3)
+
+    # gamma 或 翻转
+    # array = gamma_transform(array)
+    # array = np.fliplr(array)
+
+    cv2.imwrite("enhanced_input.png", array)
+    return array
+
 
     # Convert it to a Numpy array
     return SimpleITK.GetArrayFromImage(result)
