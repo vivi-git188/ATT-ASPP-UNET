@@ -204,7 +204,7 @@ def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number
     # 7️⃣ 读取写入后的文件做最终验证
     check_img = SimpleITK.ReadImage(location / f"output{suffix}")
     arr_check = SimpleITK.GetArrayFromImage(check_img)
-    print("Saved output.mha info:")
+    print("✅ Saved output.mha info:")
     print("Shape:", arr_check.shape)
     print("Spacing:", check_img.GetSpacing())
     print("Unique values in saved file:", np.unique(arr_check))
