@@ -174,6 +174,8 @@ def write_array_as_image_file(*, location, array, frame_number=None):
         frame_number=frame_number,
         number_of_frames=128,#840
     )
+    # 🚨 强制二值化（关键步骤！）⚠️
+    array = (array > 0.5).astype(np.uint8)
 
     image = SimpleITK.GetImageFromArray(array)
     # Set the spacing to 0.28mm in all directions
