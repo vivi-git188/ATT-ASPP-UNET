@@ -63,6 +63,8 @@ def run():
     # Select the fetal abdomen mask and the corresponding frame number
     fetal_abdomen_segmentation, fetal_abdomen_frame_number = select_fetal_abdomen_mask_and_frame(
         fetal_abdomen_postprocessed)
+    print(f"掩码值分布: {np.unique(fetal_abdomen_segmentation)}")
+    print(f"预测像素总数: {(fetal_abdomen_segmentation > 0).sum()}")
 
     # Save your output
     write_array_as_image_file(
@@ -140,6 +142,8 @@ def write_array_as_image_file(*, location, array, frame_number=None):
 
 
 def convert_2d_mask_to_3d(*, mask_2d, frame_number, number_of_frames):
+    # 把 1 → 2，这样 ITK-SNAP 会显示为绿色
+    mask_2d = np.where(mask_2d == 1, 2, 0).astype(np.uint8)
     # Convert a 2D mask to a 3D mask
     mask_3d = np.zeros((number_of_frames, *mask_2d.shape), dtype=np.uint8)
     # If frame_number == -1, return a 3D mask with all zeros
