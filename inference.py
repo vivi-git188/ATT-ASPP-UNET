@@ -126,7 +126,7 @@ def load_image_file_as_array(*, location):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 预先创建 CLAHE 实例
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))#clipLimit = 0.8也不错
 
     enhanced_stack = []
     for i, sl in enumerate(array):             # 遍历原始每一帧
@@ -162,27 +162,52 @@ def get_image_file_path(*, location):
     return input_files
 
 
-def write_array_as_image_file(*, location, array, frame_number=None):
+import numpy as np
+import SimpleITK
+from pathlib import Path
+
+def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number: int = None):
     location.mkdir(parents=True, exist_ok=True)
     suffix = ".mha"
-    # Assert that the array is 2D
+
+    # 1️⃣ 仅支持 2D mask（单帧）
     assert array.ndim == 2, f"Expected a 2D array, got {array.ndim}D."
-    
-    # Convert the 2D mask to a 3D mask (this is solely for visualization purposes)
-    array = convert_2d_mask_to_3d(
-        mask_2d=array,
+
+    # 2️⃣ 保留 float 概率图用于调试或软 Dice 评估
+    prob_map = array.astype(np.float32)
+
+    # 3️⃣ 转成 3D：放入 128 帧堆栈中指定帧位
+    array_3d = convert_2d_mask_to_3d(
+        mask_2d=prob_map,
         frame_number=frame_number,
-        number_of_frames=128,#840
+        number_of_frames=128,
     )
 
-    image = SimpleITK.GetImageFromArray(array)
-    # Set the spacing to 0.28mm in all directions
+    # 4️⃣ 确保最后输出是二值掩码 ∈ {0, 1}，且为 uint8
+    array_3d = np.where(array_3d > 0.5, 1, 0).astype(np.uint8)
+
+    # 5️⃣ （保险）检查是否确实只有 0 和 1
+    unique_vals = np.unique(array_3d)
+    print("DEBUG: Unique values in 3D mask:", unique_vals)
+    assert set(unique_vals).issubset({0, 1}), f"Non-binary values detected: {unique_vals}"
+
+    # 6️⃣ 写入 .mha，显式指定类型为 sitkUInt8
+    image = SimpleITK.GetImageFromArray(array_3d)
+    image = SimpleITK.Cast(image, SimpleITK.sitkUInt8)
     image.SetSpacing([0.28, 0.28, 0.28])
     SimpleITK.WriteImage(
         image,
         location / f"output{suffix}",
         useCompression=True,
     )
+
+    # 7️⃣ 读取写入后的文件做最终验证
+    check_img = SimpleITK.ReadImage(location / f"output{suffix}")
+    arr_check = SimpleITK.GetArrayFromImage(check_img)
+    print("✅ Saved output.mha info:")
+    print("Shape:", arr_check.shape)
+    print("Spacing:", check_img.GetSpacing())
+    print("Unique values in saved file:", np.unique(arr_check))
 
 
 def convert_2d_mask_to_3d(*, mask_2d, frame_number, number_of_frames):
