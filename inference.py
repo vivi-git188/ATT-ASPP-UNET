@@ -25,8 +25,18 @@ from pathlib import Path
 import numpy as np
 import SimpleITK
 import cv2
-from model_attention_aspp import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
+TAG = os.getenv("MODEL_TAG", "baseline")
 
+if TAG == "att_aspp":
+    from model_attention_aspp import (
+        FetalAbdomenSegmentation,
+        select_fetal_abdomen_mask_and_frame,
+    )
+else:  # baseline
+    from model import (
+        FetalAbdomenSegmentation,
+        select_fetal_abdomen_mask_and_frame,
+    )
 # from model import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
 # ./test
 INPUT_PATH = Path("./test/input")
