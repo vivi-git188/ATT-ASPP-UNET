@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from attention_aspp_unet import AttentionASPPUNet          # ← 你的网络代码
-from postprocess_probability_maps import postprocess_single_probability_map
+from aspp_postprocess_probability_maps import postprocess_single_probability_map
 
 
 # ----------------------------

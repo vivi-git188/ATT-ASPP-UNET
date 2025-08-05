@@ -68,6 +68,28 @@ def run():
     print(f"掩码值分布: {np.unique(fetal_abdomen_segmentation)}")
     print(f"预测像素总数: {(fetal_abdomen_segmentation > 0).sum()}")
 
+    # -----------------------------------------------------------
+    # ⬆︎⬆︎⬆︎  这里开始是『把 224×224 掩码放大回 744×562』的补丁  ⬆︎⬆︎⬆︎
+    # -----------------------------------------------------------
+    import cv2, SimpleITK
+
+    # 1️⃣ 读取原始 3-D 超声序列，拿到真实的 (H,W)
+    ref_img  = SimpleITK.ReadImage(stacked_fetal_ultrasound_path[0])
+    _, ref_h, ref_w = SimpleITK.GetArrayFromImage(ref_img).shape   # (N,H,W)
+
+    # 2️⃣ 若当前掩码尺寸不是原尺寸，就最近邻放大 / 缩小
+    if fetal_abdomen_segmentation.shape != (ref_h, ref_w):
+        fetal_abdomen_segmentation = cv2.resize(
+            fetal_abdomen_segmentation.astype("uint8"),   # 先转 uint8 防止 cv2 出警告
+            (ref_w, ref_h),                               # 注意 (W,H) 顺序
+            interpolation=cv2.INTER_NEAREST               # 最近邻，不会引入 0/1 以外的值
+        )
+
+    # 3️⃣ （可选）确保仍然是二值
+    fetal_abdomen_segmentation = (fetal_abdomen_segmentation > 0).astype("uint8")
+    # -----------------------------------------------------------
+    # ⬇︎⬇︎⬇︎  下面继续原来的 write_array_as_image_file 调用  ⬇︎⬇︎⬇︎
+
     # Save your output
     write_array_as_image_file(
         location=OUTPUT_PATH / "images/fetal-abdomen-segmentation",
