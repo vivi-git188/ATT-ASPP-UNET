@@ -25,11 +25,12 @@ from pathlib import Path
 import numpy as np
 import SimpleITK
 import cv2
+from model_attention_aspp import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
 
-from model import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
+# from model import FetalAbdomenSegmentation, select_fetal_abdomen_mask_and_frame
 # ./test
-INPUT_PATH = Path("/input")
-OUTPUT_PATH = Path("/output")
+INPUT_PATH = Path("./test/input")
+OUTPUT_PATH = Path("./test/output")
 RESOURCE_PATH = Path("resources")
 
 
@@ -122,7 +123,7 @@ def load_image_file_as_array(*, location):
         raise ValueError(f"Expected 3-D image (frames, H, W), got {array.shape}")
 
     # 输出文件夹，用来存几张对比图（可选）
-    out_dir = Path("/output/images")
+    out_dir = Path("test/output/images")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 预先创建 CLAHE 实例
@@ -169,7 +170,7 @@ from pathlib import Path
 def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number: int = None):
     location.mkdir(parents=True, exist_ok=True)
     suffix = ".mha"
-
+    array = np.squeeze(array)  # 去掉多余维度
     # 1️⃣ 仅支持 2D mask（单帧）
     assert array.ndim == 2, f"Expected a 2D array, got {array.ndim}D."
 
