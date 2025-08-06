@@ -70,25 +70,29 @@ class FetalAbdomenSegmentation:
     # ---------- 后处理 ----------
         # ---------- 后处理 ----------
     def postprocess(self, probability_map):
-        """对齐标注帧；若 json 为单 int 直接用，否则 dict lookup; 若失败回退面积峰值"""
-        frame_idx = -1
-        json_path = Path("test/output/fetal-abdomen-frame-number.json")
-        if json_path.exists():
-            try:
-                data = json.loads(json_path.read_text())
-                # Grand‑Challenge 导出的 json 既可能是 {case:idx} 也可能直接是 int
-                frame_idx = int(data if isinstance(data, int) else data.get(self.case_id, -1))
-            except Exception as e:
-                print(f"[WARN] frame json parse fail: {e}")
+        """在 128 帧体积中选择前景面积最大的帧并做简单清噪。完全摆脱对
+        fetal‑abdomen‑frame‑number.json 的依赖，避免所有 case 都写入同一帧。"""
+        import scipy.ndimage as ndi
+        bin_ = (probability_map > 0.05).astype(np.uint8)         # (N,H,W)
 
-        bin_ = (probability_map > 0.05).astype(np.uint8)
-        if frame_idx < 0 or frame_idx >= bin_.shape[0] or bin_[frame_idx].sum() == 0:
-            frame_idx = int(bin_.sum((1, 2)).argmax())  # fallback
+        # ① 直接选面积最大的那一帧
+        frame_idx = int(bin_.sum((1, 2)).argmax())
+        if bin_[frame_idx].sum() == 0:
+            return np.zeros_like(bin_, np.uint8)                 # 全 0 fallback
 
         frame = bin_[frame_idx]
-        if frame.ndim != 2 or frame.size == 0:          # 安全检查
-            mask = np.zeros_like(bin_, np.uint8); mask[frame_idx] = frame.astype(np.uint8)
-            return mask
+
+        # ② 膨胀 + 最大连通域（3×3 结构）
+        structure = np.ones((3, 3), dtype=np.uint8)
+        frame = ndi.binary_dilation(frame, structure=structure, iterations=1)
+        labeled, n = ndi.label(frame, structure=structure)
+        if n:
+            sizes = ndi.sum(frame, labeled, index=range(1, n + 1))
+            frame = (labeled == (np.argmax(sizes) + 1)).astype(np.uint8)
+
+        mask = np.zeros_like(bin_, np.uint8);
+        mask[frame_idx] = frame
+        return mask
 
         # 膨胀 + 最大连通域（显式 3×3 结构，避免 SciPy 维度报错）
         structure = np.ones((3, 3), dtype=np.uint8)
