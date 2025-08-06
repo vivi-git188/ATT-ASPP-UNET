@@ -25,6 +25,9 @@ from pathlib import Path
 import numpy as np
 import SimpleITK
 import cv2
+
+case_id = os.getenv("CASE_ID", "output")  # fallback 名为 output.mha
+
 TAG = os.getenv("MODEL_TAG", "baseline")
 
 if TAG == "att_aspp":
@@ -44,7 +47,7 @@ OUTPUT_PATH = Path("./test/output")
 RESOURCE_PATH = Path("resources")
 
 
-def run():
+def run(case_id=case_id):
     # Read the input
     stacked_fetal_ultrasound_path = get_image_file_path(
         location=INPUT_PATH / "images/stacked-fetal-ultrasound")
@@ -85,6 +88,7 @@ def run():
 
     # 1️⃣ 读取原始 3-D 超声序列，拿到真实的 (H,W)
     ref_img  = SimpleITK.ReadImage(stacked_fetal_ultrasound_path[0])
+    n_frames = SimpleITK.GetArrayFromImage(ref_img).shape[0]  # ← 840
     _, ref_h, ref_w = SimpleITK.GetArrayFromImage(ref_img).shape   # (N,H,W)
 
     # 2️⃣ 若当前掩码尺寸不是原尺寸，就最近邻放大 / 缩小
@@ -104,7 +108,9 @@ def run():
     write_array_as_image_file(
         location=OUTPUT_PATH / "images/fetal-abdomen-segmentation",
         array=fetal_abdomen_segmentation,
-        frame_number=fetal_abdomen_frame_number,
+        frame_number=fetal_abdomen_frame_number,  # 305
+        number_of_frames=n_frames,  # ✅ 传 840 而不是默认 128
+        filename = f"{case_id}.mha"  # 👈 传入你希望的输出文件名
     )
     write_json_file(
         location=OUTPUT_PATH / "fetal-abdomen-frame-number.json",
@@ -199,7 +205,12 @@ import numpy as np
 import SimpleITK
 from pathlib import Path
 
-def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number: int = None):
+def write_array_as_image_file(
+        *, location: Path, array: np.ndarray,
+        frame_number: int = None,
+        number_of_frames: int = 128,   # ← 新增，默认仍兼容旧逻辑
+        filename: str = "output.mha"  # 👈 默认仍为原名
+):
     location.mkdir(parents=True, exist_ok=True)
     suffix = ".mha"
     array = np.squeeze(array)  # 去掉多余维度
@@ -213,9 +224,8 @@ def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number
     array_3d = convert_2d_mask_to_3d(
         mask_2d=prob_map,
         frame_number=frame_number,
-        number_of_frames=128,
+        number_of_frames=number_of_frames  # ← 这里用传进来的真实帧数
     )
-
     # 4️⃣ 确保最后输出是二值掩码 ∈ {0, 1}，且为 uint8
     array_3d = np.where(array_3d > 0.5, 1, 0).astype(np.uint8)
 
@@ -230,12 +240,13 @@ def write_array_as_image_file(*, location: Path, array: np.ndarray, frame_number
     image.SetSpacing([0.28, 0.28, 0.28])
     SimpleITK.WriteImage(
         image,
-        location / f"output{suffix}",
+        location / filename,
         useCompression=True,
     )
 
     # 7️⃣ 读取写入后的文件做最终验证
-    check_img = SimpleITK.ReadImage(location / f"output{suffix}")
+    check_img = SimpleITK.ReadImage(location / filename)
+
     arr_check = SimpleITK.GetArrayFromImage(check_img)
     print("✅ Saved output.mha info:")
     print("Shape:", arr_check.shape)
