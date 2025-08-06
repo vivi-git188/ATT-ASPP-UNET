@@ -228,6 +228,8 @@ def train(args):
             print("[✓] Best model saved.")
 
 # --- Predict ---
+from skimage.measure import label
+
 @torch.inference_mode()
 def predict(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,22 +238,30 @@ def predict(args):
 
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    transform = Compose([SafeCLAHE(1.0, (8,8)), SafeMedianBlur(3), ToFloat(max_value=255.0), ToTensorV2()])
 
-    for img_path in sorted(input_dir.iterdir()):
-        if img_path.suffix.lower() not in {'.png','.jpg','.mha'}: continue
-        if img_path.suffix == '.mha':
-            arr = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))
-            if arr.ndim == 3: arr = arr[arr.shape[0] // 2]
-        else:
-            arr = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-        sample = transform(image=arr)
-        x = sample["image"].unsqueeze(0).to(device)
-        pred = torch.sigmoid(model(x)).cpu().numpy()[0,0]
-        mask = (pred > 0.5).astype(np.uint8) * 255
-        save_path = out_dir / (img_path.stem + ".png")
-        cv2.imwrite(str(save_path), mask)
-        print(f"[✓] Saved: {save_path.name}")
+    for img_path in sorted(input_dir.glob("*.mha")):
+        arr3d = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))  # (N,H,W)
+        pred_masks = []
+
+        for i, sl in enumerate(arr3d):
+            sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8,8))
+            enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+            sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
+            x = sample["image"].unsqueeze(0).to(device)
+            pred = torch.sigmoid(model(x)).cpu().numpy()[0, 0]
+            mask = (pred > 0.5).astype(np.uint8)
+            pred_masks.append(mask)
+
+        pred_stack = np.stack(pred_masks)  # shape: (N,H,W)
+
+        # 选帧：找最大面积的 mask 帧
+        best_frame = max(range(pred_stack.shape[0]), key=lambda i: (pred_stack[i] > 0).sum())
+        best_mask = pred_stack[best_frame]
+
+        # 保存 .mha + .json
+        write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
+
 
 # --- CLI ---
 def get_args():
@@ -268,6 +278,48 @@ def get_args():
     pr.add_argument("--input_dir", required=True)
     pr.add_argument("--out_dir", default="./preds")
     return p.parse_args()
+
+
+import SimpleITK as sitk
+import json
+
+def convert_mask_2d_to_3d(mask_2d: np.ndarray, frame: int, total_frames: int):
+    mask_2d = (mask_2d > 0).astype(np.uint8) * 2  # 保持 ITK-SNAP 绿色
+    mask_3d = np.zeros((total_frames, *mask_2d.shape), dtype=np.uint8)
+    if 0 <= frame < total_frames:
+        mask_3d[frame] = mask_2d
+    return mask_3d
+
+
+def write_output_mha_and_json(mask_2d: np.ndarray, frame: int, reference_mha_path: Path, output_dir: Path):
+    case_name = reference_mha_path.stem
+    case_out_dir = output_dir / case_name
+
+    # 读取参考原图
+    ref_img = sitk.ReadImage(str(reference_mha_path))
+    total_frames = ref_img.GetSize()[2]  # 获取 Z 轴帧数（必须匹配）
+
+    # 构造掩码 3D
+    mask_3d = convert_mask_2d_to_3d(mask_2d, frame, total_frames)
+
+    # 构造 sitk image + metadata
+    output_img = sitk.GetImageFromArray(mask_3d)
+    output_img.CopyInformation(ref_img)
+
+    # 写入 .mha
+    output_mha_path = case_out_dir / "images/fetal-abdomen-segmentation/output.mha"
+    output_mha_path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(output_img, str(output_mha_path))
+
+    # 写入 JSON
+    json_path = case_out_dir / "fetal-abdomen-frame-number.json"
+    with open(json_path, "w") as f:
+        json.dump(frame, f, indent=2)
+
+    print(f"[✓] {case_name} → output.mha (frame {frame})")
+
+
+
 
 if __name__ == "__main__":
     args = get_args()
