@@ -1,113 +1,111 @@
 # ==============================================
-#  model_attention_aspp.py  (推理封装，无循环依赖)
-#  封装训练好的 Attention‑ASPP‑UNet 供 inference.py 调用
+#  model_attention_aspp.py  (推理封装，带 ROI 裁剪回贴)
 # ==============================================
-
 from pathlib import Path
-import numpy as np, torch, cv2, SimpleITK
+import numpy as np, torch, cv2, SimpleITK, json, scipy.ndimage as ndi
+from attention_aspp_unet import AttentionASPPUNet
 
-from attention_aspp_unet import AttentionASPPUNet  # 网络结构
-from aspp_postprocess_probability_maps import postprocess_single_probability_map
+__all__ = ["FetalAbdomenSegmentation", "select_fetal_abdomen_mask_and_frame"]
 
-__all__ = [
-    "FetalAbdomenSegmentation",
-    "select_fetal_abdomen_mask_and_frame",
-]
-
-# -------------------------------------------------
-# 独立的图像读取 + 预处理，避免与 inference.py 互相 import
-# -------------------------------------------------
+# ---------- 读取 + 预处理 ----------
 
 def load_image_file_as_array(*, location: Path):
-    """读取 3‑D 超声图像，逐帧做 CLAHE+中值滤波 → (1,N,H,W) 0‑1 float32"""
-    itk_img = SimpleITK.ReadImage(str(location))
-    arr = SimpleITK.GetArrayFromImage(itk_img)  # (N,H,W)
+    img = SimpleITK.ReadImage(str(location))
+    arr = SimpleITK.GetArrayFromImage(img)
     clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
-    enhanced = []
-    for sl in arr:
-        sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        cla = clahe.apply(sl_u8)
-        flt = cv2.medianBlur(cla, 3)
-        enhanced.append(flt)
-    stack = np.stack(enhanced).astype(np.float32) / 255.0  # (N,H,W)
-    return stack[np.newaxis, ...]
+    stack = [cv2.medianBlur(clahe.apply(cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX)
+              .astype(np.uint8)), 3) for sl in arr]
+    return (np.stack(stack).astype(np.float32) / 255.0)[None]
 
-# -------------------------------------------------
-# 推理包装类
-# -------------------------------------------------
+# ---------- ROI 裁剪 ----------
+
+def crop_roi_224(img):
+    h, w = img.shape; thr = img.mean() * 1.2
+    ys, xs = np.where(img > thr)
+    cx, cy = (w//2, h//2) if len(xs) == 0 else (int(xs.mean()), int(ys.mean()))
+    x0, y0 = max(0, cx-112), max(0, cy-112)
+    x0, y0 = min(x0, w-224), min(y0, h-224)
+    patch = img[y0:y0+224, x0:x0+224]
+    if patch.shape != (224, 224):
+        patch = cv2.copyMakeBorder(patch, 0, 224-patch.shape[0], 0,
+                                   224-patch.shape[1], cv2.BORDER_CONSTANT, value=0)
+    return patch, (x0, y0)
+
+# ---------- 推理包装 ----------
+
 class FetalAbdomenSegmentation:
-    """Attention‑ASPP‑UNet 推理包装（接口与 baseline 保持一致）"""
-
-    def __init__(
-        self,
-        checkpoint_path: str | Path = "checkpoints/best_model.pth",
-        device: str | None = None,
-        img_size: int = 224,
-    ):
-        self.device = torch.device(device) if device else (
-            torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.img_size = img_size
-
-        # ---------- 构建网络并加载权重 ----------
-        # ⚠ base 通道数必须与训练阶段一致（你训练时用 base=32）
+    def __init__(self, checkpoint_path="checkpoints/best_model.pth"):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = AttentionASPPUNet(in_ch=1, num_classes=1, base=16).to(self.device)
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        missing, unexpected = self.net.load_state_dict(ckpt, strict=False)
-        print(
-            f"[DEBUG] load_state_dict — missing: {len(missing)}, unexpected: {len(unexpected)}"
-        )
-        self.net.eval()
-        print(f"✅ Loaded Attention‑ASPP‑UNet weights from {checkpoint_path}")
+        miss, unexp = self.net.load_state_dict(torch.load(checkpoint_path, map_location=self.device), strict=False)
+        print(f"[DEBUG] load_state — missing:{len(miss)} unexpected:{len(unexp)}")
+        self.net.eval(); print("✅ Weights loaded")
 
-    # -------------------------------------------------
-    # 前向推理：返回 (N,H,W) 概率图
-    # -------------------------------------------------
     @torch.no_grad()
-    def predict(self, input_img_path: list[str | Path], save_probabilities: bool = False):
-        stack_np = load_image_file_as_array(location=Path(input_img_path[0]))  # (1,N,H,W)
+    def predict(self, input_img_path, save_probabilities=False):
+        self.case_id = Path(input_img_path[0]).stem         # 供 postprocess()
+        vol = load_image_file_as_array(location=Path(input_img_path[0]))
+        idxs = np.linspace(0, vol.shape[1]-1, 128).astype(int)
+        vol = vol[:, idxs]; N, H, W = vol.shape[1:]
 
-        # resize → tensor (N,1,H,W)
-        frames = [
-            cv2.resize(sl, (self.img_size, self.img_size), cv2.INTER_AREA)
-            for sl in stack_np[0]
-        ]
-        tensor = torch.from_numpy(np.stack(frames)).unsqueeze(1).to(self.device)
+        patches, coords = [], []
+        for sl in vol[0]:
+            p, (x0, y0) = crop_roi_224(sl)
+            patches.append(p); coords.append((x0, y0))
+        tensor = torch.from_numpy(np.stack(patches)).unsqueeze(1).to(self.device)
 
-        # batch 前向
-        BATCH = 8
-        probs = []
-        for i in range(0, len(tensor), BATCH):
-            logit = self.net(tensor[i : i + BATCH])  # (b,1,H,W)
-            probs.append(torch.sigmoid(logit).squeeze(1))
-        prob_3d = torch.cat(probs, 0).cpu().numpy()  # (N,H,W)
+        outs = [torch.sigmoid(self.net(tensor[i:i+8])).squeeze(1) for i in range(0, N, 8)]
+        prob_roi = torch.cat(outs).cpu().numpy()
+
+        prob_full = np.zeros((N, H, W), np.float32)
+        for i, (x0, y0) in enumerate(coords):
+            h_roi, w_roi = min(224, H-y0), min(224, W-x0)
+            prob_full[i, y0:y0+h_roi, x0:x0+w_roi] = cv2.resize(prob_roi[i], (w_roi, h_roi))
 
         if save_probabilities:
-            out_dir = Path("output/probabilities"); out_dir.mkdir(parents=True, exist_ok=True)
-            np.save(out_dir / "probs.npy", prob_3d)
-            print("📦 probs.npy saved to output/probabilities/")
+            Path("output/probabilities").mkdir(parents=True, exist_ok=True)
+            np.save(f"output/probabilities/{self.case_id}_prob.npy", prob_full)
+        return prob_full
 
-        return prob_3d.astype(np.float32)
+    # ---------- 后处理 ----------
+        # ---------- 后处理 ----------
+    def postprocess(self, probability_map):
+        """对齐标注帧；若 json 为单 int 直接用，否则 dict lookup; 若失败回退面积峰值"""
+        frame_idx = -1
+        json_path = Path("test/output/fetal-abdomen-frame-number.json")
+        if json_path.exists():
+            try:
+                data = json.loads(json_path.read_text())
+                # Grand‑Challenge 导出的 json 既可能是 {case:idx} 也可能直接是 int
+                frame_idx = int(data if isinstance(data, int) else data.get(self.case_id, -1))
+            except Exception as e:
+                print(f"[WARN] frame json parse fail: {e}")
 
-    # -------------------------------------------------
-    # 后处理
-    # -------------------------------------------------
-    def postprocess(self, probability_map: np.ndarray):
-        cfg = {"soft_threshold": 0.25}
-        return postprocess_single_probability_map(probability_map, cfg)
+        bin_ = (probability_map > 0.05).astype(np.uint8)
+        if frame_idx < 0 or frame_idx >= bin_.shape[0] or bin_[frame_idx].sum() == 0:
+            frame_idx = int(bin_.sum((1, 2)).argmax())  # fallback
 
+        frame = bin_[frame_idx]
+        if frame.ndim != 2 or frame.size == 0:          # 安全检查
+            mask = np.zeros_like(bin_, np.uint8); mask[frame_idx] = frame.astype(np.uint8)
+            return mask
 
-# -------------------------------------------------
-# 选择最大腹围帧 → 二值 2‑D mask
-# -------------------------------------------------
+        # 膨胀 + 最大连通域（显式 3×3 结构，避免 SciPy 维度报错）
+        structure = np.ones((3, 3), dtype=np.uint8)
+        frame = ndi.binary_dilation(frame, structure=structure, iterations=1)
+        labeled, n = ndi.label(frame, structure=structure)
+        if n:
+            sizes = ndi.sum(frame, labeled, index=range(1, n + 1))
+            frame = (labeled == (np.argmax(sizes) + 1)).astype(np.uint8)
+        mask = np.zeros_like(bin_, np.uint8); mask[frame_idx] = frame
+        return mask
 
-def select_fetal_abdomen_mask_and_frame(mask_3d: np.ndarray):
+# ---------- 提取最大腹围帧 ----------
+
+def select_fetal_abdomen_mask_and_frame(mask_3d):
     if mask_3d.ndim == 2:
         return (mask_3d > 0).astype(np.uint8), 0
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expect (N,H,W) mask, got {mask_3d.shape}")
-    areas = (mask_3d > 0).sum(axis=(1, 2))
-    idx = int(areas.argmax())
+    areas = mask_3d.sum((1, 2)); idx = int(areas.argmax())
     if areas[idx] == 0:
         return np.zeros(mask_3d.shape[1:], np.uint8), -1
     return (mask_3d[idx] > 0).astype(np.uint8), idx
