@@ -65,6 +65,8 @@ class FetalAbdomenSegmentation:
     # -------------------------------------------------
     @torch.no_grad()
     def predict(self, input_img_path: list[str | Path], save_probabilities: bool = False):
+        # predict 函数开头加入：
+        self.case_id = Path(input_img_path[0]).stem
         stack_np = load_image_file_as_array(location=Path(input_img_path[0]))  # (1,N,H,W)
 
         # resize → tensor (N,1,H,W)
@@ -93,8 +95,39 @@ class FetalAbdomenSegmentation:
     # 后处理
     # -------------------------------------------------
     def postprocess(self, probability_map: np.ndarray):
-        cfg = {"soft_threshold": 0.25}
-        return postprocess_single_probability_map(probability_map, cfg)
+        """
+        1) 使用标注帧编号（fetal-abdomen-frame-number.json）进行后处理
+        2) 保留对应帧的 mask，膨胀+最大连通域
+        3) 返回与 (N,H,W) 相同尺寸的 uint8 掩码
+        """
+        import scipy.ndimage as ndi
+        import json
+
+        # 获取当前 case ID（去掉路径和后缀）
+        case_id = self.case_id  # ← 新增字段（下方 predict 函数会赋值）
+
+        # 读取对应帧号
+        with open("test/output/fetal-abdomen-frame-number.json") as f:
+            frame_numbers = json.load(f)
+            print(f"frame number: {frame_numbers}")
+        frame_idx = frame_numbers[case_id]
+
+        bin_ = (probability_map > 0.05).astype(np.uint8)
+        if bin_[frame_idx].sum() == 0:
+            return np.zeros_like(bin_, dtype=np.uint8)
+
+        mask = np.zeros_like(bin_, dtype=np.uint8)
+        frame = bin_[frame_idx]
+
+        # 膨胀 + 最大连通域
+        frame = ndi.binary_dilation(frame, iterations=1)
+        labeled, n = ndi.label(frame)
+        if n > 0:
+            sizes = ndi.sum(frame, labeled, index=range(1, n + 1))
+            frame = (labeled == (np.argmax(sizes) + 1)).astype(np.uint8)
+
+        mask[frame_idx] = frame
+        return mask
 
 
 # -------------------------------------------------
