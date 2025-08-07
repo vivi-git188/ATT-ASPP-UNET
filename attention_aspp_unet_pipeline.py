@@ -183,8 +183,8 @@ def evaluate(model, loader, device):
 
 # --- Train ---
 def train(args):
-    root_train = Path("train_png")
-    root_val = Path("val_png")
+    root_train = Path("train_png_best")
+    root_val = Path("val_png_best")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_imgs, train_msks = collect_pairs(root_train/"images", root_train/"masks")
 
@@ -239,28 +239,44 @@ def predict(args):
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    for img_path in sorted(input_dir.glob("*.mha")):
-        arr3d = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))  # (N,H,W)
-        pred_masks = []
-
-        for i, sl in enumerate(arr3d):
+    for img_path in sorted(input_dir.iterdir()):
+        if img_path.suffix.lower() in {'.png', '.jpg', '.jpeg'}:
+            # === 用 OpenCV 正确读取 PNG 图像 ===
+            sl = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)  # shape: (H, W)
             sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
             enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+
             sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
-            x = sample["image"].unsqueeze(0).to(device)
+            x = sample["image"].unsqueeze(0).to(device)  # shape: (1, 1, H, W)
+
             pred = torch.sigmoid(model(x)).cpu().numpy()[0, 0]
             mask = (pred > 0.5).astype(np.uint8)
-            pred_masks.append(mask)
 
-        pred_stack = np.stack(pred_masks)  # shape: (N,H,W)
+            out_path = out_dir / f"{img_path.stem}_mask.png"
+            cv2.imwrite(str(out_path), mask * 255)
+            print(f"[✓] Saved: {out_path}")
 
-        # 选帧：找最大面积的 mask 帧
-        best_frame = max(range(pred_stack.shape[0]), key=lambda i: (pred_stack[i] > 0).sum())
-        best_mask = pred_stack[best_frame]
+        elif img_path.suffix.lower() == '.mha':
+            # === 保留原先自动帧选择逻辑 ===
+            arr3d = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))  # shape: (N, H, W)
+            pred_masks = []
+            for i, sl in enumerate(arr3d):
+                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+                enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
 
-        # 保存 .mha + .json
-        write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
+                sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
+                x = sample["image"].unsqueeze(0).to(device)
+
+                pred = torch.sigmoid(model(x)).cpu().numpy()[0, 0]
+                mask = (pred > 0.5).astype(np.uint8)
+                pred_masks.append(mask)
+
+            pred_stack = np.stack(pred_masks)  # shape: (N, H, W)
+            best_frame = max(range(pred_stack.shape[0]), key=lambda i: (pred_stack[i] > 0).sum())
+            best_mask = pred_stack[best_frame]
+            write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
 
 
 # --- CLI ---
