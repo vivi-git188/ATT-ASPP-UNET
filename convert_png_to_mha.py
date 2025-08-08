@@ -37,8 +37,8 @@ def convert_one_png_mask_to_mha(
 # === 用法示例 ===
 if __name__ == "__main__":
     convert_one_png_mask_to_mha(
-        mask_png_path="preds_fixed_frame/02ee26a5-a665-4531-bec1-8bac83345a94_s052_mask.png",
-        ref_mha_path="val/images/02ee26a5-a665-4531-bec1-8bac83345a94.mha",
-        frame_index=52,
-        output_path="converted_mask/02ee26a5_s052_pred.mha"
+        mask_png_path="outputs/preds_fixed_frame_circle/0d7c4d8f-6e07-4f2b-aa76-8915ce15a38f_s304_mask.png",
+        ref_mha_path="val/images/0d7c4d8f-6e07-4f2b-aa76-8915ce15a38f.mha",
+        frame_index=304,
+        output_path="converted_mask/a38f_s304_pred_new.mha"
     )
