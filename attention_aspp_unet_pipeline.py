@@ -10,11 +10,22 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split
 from albumentations import CLAHE, Compose, HorizontalFlip, MedianBlur, RandomGamma, ToFloat
 from albumentations.pytorch import ToTensorV2
+from albumentations import Resize, ShiftScaleRotate, RandomBrightnessContrast
+
 
 try:
     import SimpleITK as sitk
 except ImportError:
     sitk = None
+
+
+IMG_SIZE = 512            # or 512 if GPU OK
+WEIGHT_DECAY = 5e-4
+
+# 损失选择：'combo' 用 Dice+BCE；'tversky' 用 Tversky
+LOSS_TYPE = 'combo'       # 'combo' | 'tversky'
+TV_ALPHA, TV_BETA = 0.7, 0.3
+
 
 # --- Patch: remove deprecated "always_apply" ---
 def SafeCLAHE(*args, **kwargs):
@@ -122,11 +133,27 @@ class FetalACDataset(Dataset):
         self.transform = self._build_transform()
 
     def _build_transform(self):
-        tf = [SafeCLAHE(1.0, (8,8)), SafeMedianBlur(3), ToFloat(max_value=255.0), ToTensorV2()]
-        if self.train:
-            tf.insert(2, HorizontalFlip(p=0.5))
-            tf.insert(3, RandomGamma((80,120), p=0.5))
-        return Compose(tf)
+        # 先做几何，再做强度增强，最后转tensor
+        t_train = [
+            Resize(IMG_SIZE, IMG_SIZE),
+            HorizontalFlip(p=0.5),
+            ShiftScaleRotate(shift_limit=0.02, scale_limit=0.08, rotate_limit=7,
+                             border_mode=cv2.BORDER_REFLECT_101, p=0.7),
+            RandomGamma((80, 120), p=0.3),
+            RandomBrightnessContrast(0.1, 0.1, p=0.3),
+            SafeCLAHE(1.0, (8, 8)),
+            SafeMedianBlur(3),
+            ToFloat(max_value=255.0),
+            ToTensorV2()
+        ]
+        t_val = [
+            Resize(IMG_SIZE, IMG_SIZE),
+            SafeCLAHE(1.0, (8, 8)),
+            SafeMedianBlur(3),
+            ToFloat(max_value=255.0),
+            ToTensorV2()
+        ]
+        return Compose(t_train if self.train else t_val)
 
     def __len__(self): return len(self.img_paths)
 
@@ -163,6 +190,30 @@ class DiceLoss(nn.Module):
         num = 2*(p*targets).sum((2,3)) + self.smooth
         den = p.sum((2,3)) + targets.sum((2,3)) + self.smooth
         return (1 - num/den).mean()
+
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1.):
+        super().__init__()
+        self.alpha, self.beta, self.smooth = alpha, beta, smooth
+    def forward(self, logits, targets):
+        p = torch.sigmoid(logits)
+        tp = (p*targets).sum((2,3))
+        fp = (p*(1-targets)).sum((2,3))
+        fn = ((1-p)*targets).sum((2,3))
+        tversky = (tp + self.smooth) / (tp + self.alpha*fp + self.beta*fn + self.smooth)
+        return (1 - tversky).mean()
+
+class ComboLoss(nn.Module):
+    """Dice + BCE；更稳，能缓解保守收缩"""
+    def __init__(self, dice_w=1.0, bce_w=1.0):
+        super().__init__()
+        self.dice = DiceLoss()
+        self.dw, self.bw = dice_w, bce_w
+    def forward(self, logits, targets):
+        d = self.dice(logits, targets)
+        b = F.binary_cross_entropy_with_logits(logits, targets)
+        return self.dw*d + self.bw*b
+
 
 def iou_score(logits, targets, thresh=0.5):
     preds = (torch.sigmoid(logits) > thresh).float()
@@ -201,9 +252,10 @@ def train(args):
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = AttentionASPPUNet().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = DiceLoss()
+    criterion = ComboLoss() if LOSS_TYPE == 'combo' else TverskyLoss(TV_ALPHA, TV_BETA)
 
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     best = 0.0
@@ -211,14 +263,18 @@ def train(args):
     for ep in range(1, args.epochs+1):
         model.train(); running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {ep}/{args.epochs}")
+        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         for x, y in pbar:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward(); optimizer.step()
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                logits = model(x)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item()
-            pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
+            pbar.set_postfix(loss=f"{running_loss / (pbar.n + 1):.4f}")
         scheduler.step()
         dice, iou = evaluate(model, val_loader, device)
         print(f"\n[Val] Dice: {dice:.4f} | IoU: {iou:.4f}")
@@ -229,6 +285,44 @@ def train(args):
 
 # --- Predict ---
 from skimage.measure import label
+from scipy.ndimage import binary_fill_holes
+
+def predict_prob(model, x):
+    """x: (1,1,H,W) tensor"""
+    logits = model(x)
+    # TTA: 水平翻转
+    x_flip = torch.flip(x, dims=[-1])
+    logits_flip = model(x_flip)
+    logits_flip = torch.flip(logits_flip, dims=[-1])
+    logits = (logits + logits_flip) / 2
+    return torch.sigmoid(logits).cpu().numpy()[0,0]
+
+def refine_mask(mask01: np.ndarray) -> np.ndarray:
+    if mask01.sum()==0: return mask01
+    lab = label(mask01)
+    cnt = np.bincount(lab.ravel())
+    cnt[0] = 0
+    keep = cnt.argmax()
+    m = (lab == keep).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=1)
+    m = binary_fill_holes(m).astype(np.uint8)
+    return m
+
+def circularity(mask01: np.ndarray) -> float:
+    m = (mask01>0).astype(np.uint8)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return 0.0
+    c = max(cnts, key=cv2.contourArea)
+    A = cv2.contourArea(c); P = cv2.arcLength(c, True)
+    return 0.0 if P==0 else float(4*np.pi*A/(P*P))
+
+def select_best_frame(pred_stack: np.ndarray, topk: int = 5) -> int:
+    """先按面积取 topk，再按圆度最大挑一帧"""
+    areas = np.array([(m>0).sum() for m in pred_stack])
+    idxs = areas.argsort()[::-1][:topk]
+    best = max(idxs, key=lambda i: circularity(pred_stack[i]))
+    return int(best)
 
 @torch.inference_mode()
 def predict(args):
@@ -239,6 +333,7 @@ def predict(args):
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
+    pred_probs = []
     for img_path in sorted(input_dir.iterdir()):
         if img_path.suffix.lower() in {'.png', '.jpg', '.jpeg'}:
             # === 用 OpenCV 正确读取 PNG 图像 ===
@@ -250,33 +345,42 @@ def predict(args):
             sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)  # shape: (1, 1, H, W)
 
-            pred = torch.sigmoid(model(x)).cpu().numpy()[0, 0]
-            mask = (pred > 0.5).astype(np.uint8)
+            THR = 0.45  # 全局阈值可微调 0.45~0.5
+
+            pred = predict_prob(model, x)
+            mask = (pred > THR).astype(np.uint8)
+            mask = refine_mask(mask)
 
             out_path = out_dir / f"{img_path.stem}_mask.png"
             cv2.imwrite(str(out_path), mask * 255)
             print(f"[✓] Saved: {out_path}")
 
         elif img_path.suffix.lower() == '.mha':
-            # === 保留原先自动帧选择逻辑 ===
-            arr3d = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))  # shape: (N, H, W)
-            pred_masks = []
-            for i, sl in enumerate(arr3d):
-                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
-                enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+            sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+            enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+            sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
+            x = sample["image"].unsqueeze(0).to(device)
+            prob = predict_prob(model, x)  # (H',W') 概率
+            # 还原回原分辨率
+            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]), interpolation=cv2.INTER_LINEAR)
+            pred_probs.append(prob)
 
-                sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
-                x = sample["image"].unsqueeze(0).to(device)
+    pred_probs = np.stack(pred_probs)  # (N,H,W)
 
-                pred = torch.sigmoid(model(x)).cpu().numpy()[0, 0]
-                mask = (pred > 0.5).astype(np.uint8)
-                pred_masks.append(mask)
+    # 阈值 + 后处理
+    pred_masks = []
+    for p in pred_probs:
+        m = (p > THR).astype(np.uint8)
+        m = refine_mask(m)
+        pred_masks.append(m)
+    pred_stack = np.stack(pred_masks)
 
-            pred_stack = np.stack(pred_masks)  # shape: (N, H, W)
-            best_frame = max(range(pred_stack.shape[0]), key=lambda i: (pred_stack[i] > 0).sum())
-            best_mask = pred_stack[best_frame]
-            write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
+    # 更稳的帧选择
+    best_frame = select_best_frame(pred_stack, topk=5)
+    best_mask = pred_stack[best_frame]
+
+    write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
 
 
 # --- CLI ---
