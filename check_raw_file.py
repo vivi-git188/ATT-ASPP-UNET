@@ -1,25 +1,41 @@
-import os
+# check_pairs.py
+from pathlib import Path
+import sys
 
-# 设置路径（根据你本地路径进行替换）
-images_dir = "raw/images"
-masks_dir = "raw/masks"
+base = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("train_png_best")
+img_dir = base / "images"
+msk_dir = base / "masks"
 
-# 获取文件名列表（只保留文件名，不含路径）
-image_files = sorted([f for f in os.listdir(images_dir) if os.path.isfile(os.path.join(images_dir, f))])
-mask_files = sorted([f for f in os.listdir(masks_dir) if os.path.isfile(os.path.join(masks_dir, f))])
+if not img_dir.is_dir() or not msk_dir.is_dir():
+    raise SystemExit(f"目录不存在：{img_dir} 或 {msk_dir}")
 
-# 转为集合以方便比较
-image_set = set(image_files)
-mask_set = set(mask_files)
+# 仅统计文件（忽略子目录）
+imgs = sorted(p for p in img_dir.iterdir() if p.is_file())
+msks = sorted(p for p in msk_dir.iterdir() if p.is_file())
 
-# 输出总数
-print(f"🖼️ 图像数量: {len(image_files)}")
-print(f"🎭 掩码数量: {len(mask_files)}")
+img_stems = {p.stem for p in imgs}
+msk_stems = {p.stem for p in msks}
 
-# 检查一一对应关系
-if image_set == mask_set:
-    print("✅ 文件名完全一致，一一对应")
-else:
-    print("⚠️ 文件名不一致")
-    print(f"📁 仅在 images 中的文件: {image_set - mask_set}")
-    print(f"📁 仅在 masks 中的文件: {mask_set - image_set}")
+missing_masks = sorted(img_stems - msk_stems)   # images中有而masks中没有
+extra_masks   = sorted(msk_stems - img_stems)   # masks中多出来的
+
+print(f"[Counts]")
+print(f"images: {len(imgs)} files in {img_dir}")
+print(f"masks : {len(msks)} files in {msk_dir}\n")
+
+print(f"[Check] images 中无对应 mask 的文件数：{len(missing_masks)}")
+for s in missing_masks[:50]:
+    print("  -", s)
+if len(missing_masks) > 50:
+    print(f"  ... 还有 {len(missing_masks)-50} 个未显示")
+
+print(f"\n[Check] masks 中无对应 image 的文件数：{len(extra_masks)}")
+for s in extra_masks[:50]:
+    print("  -", s)
+if len(extra_masks) > 50:
+    print(f"  ... 还有 {len(extra_masks)-50} 个未显示")
+
+# 保存清单，便于后续处理
+(out1 := base / "_images_without_masks.txt").write_text("\n".join(missing_masks))
+(out2 := base / "_masks_without_images.txt").write_text("\n".join(extra_masks))
+print(f"\n清单已保存：\n - {out1}\n - {out2}")
