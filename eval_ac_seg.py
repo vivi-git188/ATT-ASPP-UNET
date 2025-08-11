@@ -1,43 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Evaluate fetal abdomen segmentation (single case)
-Metrics: Dice, IoU, Hausdorff Distance (HD) and 95% Hausdorff (HD95)
-
-用法：
-- 直接运行：python eval_ac_seg.py
-- 先到下方 “USER CONFIG (预制路径)” 改成你图里的路径即可。
-"""
-
 import re
 from pathlib import Path
 from typing import Tuple, Dict
 import numpy as np
 import SimpleITK as sitk
 
-# ========== USER CONFIG (预制路径) ==========
-# 方案A：单目录自动识别（推荐）——三份 .mha 都在同一目录
-# 识别规则：baseline 文件名包含 "output_frame"；你的模型包含 "pred"；剩下那个视为 GT
-CASE_DIR = None  # ← 改成图中那个文件夹路径
+# ========== USER CONFIG ==========
+CASE_DIR = "output_mha"
 
-# 方案B：显式三路径（如使用则把下面三个都改成真实路径；若留 None 则使用方案A）
-MINE_PATH       = r"D:\MiniProject\ACOUSLIC\output_mha\aspp\a38f_s304_pred_new_1.mha"  # r"D:\...\xxx_gt.mha"
-BASELINE_PATH = r"D:\MiniProject\ACOUSLIC\output_mha\baseline\output_frame304.mha"  # r"D:\...\output_frame304.mha"
-GT_PATH     = r"D:\MiniProject\ACOUSLIC\output_mha\gt\0d7c4d8f-6e07-4f2b-aa76-8915ce15a38f.mha"  # r"D:\...\a38f_s304_pred_new_1.mha"
-# ===========================================
+# 显式路径（若三条都不为 None，则优先生效）
+MINE_PATH       = r"/home/ubuntu/ACOUSLIC-AI-baseline/output_mha/aspp/a38f_s304_pred_new.mha"
+BASELINE_PATH   = r"/home/ubuntu/ACOUSLIC-AI-baseline/output_mha/baseline/output_frame304.mha"
+GT_PATH         = r"/home/ubuntu/ACOUSLIC-AI-baseline/output_mha/gt/0d7c4d8f-6e07-4f2b-aa76-8915ce15a38f.mha"
+
+# ★ 新增：固定用哪一帧做对比（你要第304帧）
+FIXED_FRAME = 305          # 304
+FRAME_ONE_BASED = True     # ITK-SNAP 显示从1开始，这里设 True 会自动减1
+# ================================
 
 
 # ---------- Utils ----------
 def read_binary(path: str) -> sitk.Image:
-    """Read mask and binarize (>0 -> 1, cast to UInt8)."""
     img = sitk.ReadImage(path)
     bin_img = sitk.BinaryThreshold(img, lowerThreshold=1, upperThreshold=2**31-1,
                                    insideValue=1, outsideValue=0)
     return sitk.Cast(bin_img, sitk.sitkUInt8)
 
 def align_to_ref(img: sitk.Image, ref: sitk.Image) -> sitk.Image:
-    """Resample 'img' to the geometry of 'ref' using NN."""
     same_geom = (
         list(img.GetSize())      == list(ref.GetSize()) and
         list(img.GetSpacing())   == list(ref.GetSpacing()) and
@@ -66,7 +57,6 @@ def dice_iou(pred: sitk.Image, gt: sitk.Image) -> Tuple[float, float]:
     return float(dice), float(iou)
 
 def hd_and_hd95(a: sitk.Image, b: sitk.Image) -> Tuple[float, float]:
-    """Symmetric Hausdorff (max) + HD95（考虑物理间距）"""
     arr_a = sitk.GetArrayFromImage(a)
     arr_b = sitk.GetArrayFromImage(b)
     if arr_a.max()==0 and arr_b.max()==0:
@@ -93,24 +83,30 @@ def hd_and_hd95(a: sitk.Image, b: sitk.Image) -> Tuple[float, float]:
     hd95 = 0.0 if all_d.size == 0 else float(np.percentile(all_d, 95))
     return hd, hd95
 
-def evaluate_pair(pred_path: str, gt_path: str) -> Dict[str, float]:
-    gt   = read_binary(gt_path)
-    pred = read_binary(pred_path)
-    pred = align_to_ref(pred, gt)
-    dice, iou = dice_iou(pred, gt)
-    hd, hd95  = hd_and_hd95(pred, gt)
+def evaluate_pair(pred_img: sitk.Image, gt_img: sitk.Image) -> Dict[str, float]:
+    dice, iou = dice_iou(pred_img, gt_img)
+    hd, hd95  = hd_and_hd95(pred_img, gt_img)
     return {"Dice": dice, "IoU": iou, "HD": hd, "HD95": hd95}
+
+# ★ 新增：只保留指定 z 帧（其他帧清零）
+def keep_only_slice(img: sitk.Image, z_idx: int) -> sitk.Image:
+    arr = sitk.GetArrayFromImage(img)  # (Z,H,W)
+    if z_idx < 0 or z_idx >= arr.shape[0]:
+        raise ValueError(f"z_idx 超界：{z_idx} (Z={arr.shape[0]})")
+    out = np.zeros_like(arr, dtype=arr.dtype)
+    out[z_idx] = arr[z_idx]
+    out_img = sitk.GetImageFromArray(out)
+    out_img.CopyInformation(img)
+    return out_img
 
 # ---------- Auto-detect ----------
 def autodetect_paths(case_dir: Path) -> Dict[str, Path]:
     files = [p for p in case_dir.iterdir() if p.suffix.lower()==".mha"]
     if not files:
         raise FileNotFoundError(f"该目录下未找到 .mha：{case_dir}")
-
     baseline = next((p for p in files if re.search(r"output_frame", p.name, re.I)), None)
     mine     = next((p for p in files if re.search(r"pred", p.name, re.I)), None)
     gt_candidates = [p for p in files if p != baseline and p != mine]
-
     if baseline is None:
         raise FileNotFoundError("未找到 baseline（文件名需包含 'output_frame'）。")
     if mine is None:
@@ -122,7 +118,7 @@ def autodetect_paths(case_dir: Path) -> Dict[str, Path]:
 
 # ---------- Main ----------
 def main():
-    # 路径解析：优先显式三路径，否则用 CASE_DIR 自动识别
+    # 解析路径
     if GT_PATH and BASELINE_PATH and MINE_PATH:
         gt_path, base_path, mine_path = GT_PATH, BASELINE_PATH, MINE_PATH
     else:
@@ -137,19 +133,32 @@ def main():
     print(f"  Baseline : {base_path}")
     print(f"  Mine     : {mine_path}")
 
+    # 读取并对齐到 GT
+    gt_img   = read_binary(gt_path)
+    base_img = align_to_ref(read_binary(base_path), gt_img)
+    mine_img = align_to_ref(read_binary(mine_path), gt_img)
+
+    # ★ 固定在指定帧上做评估
+    if FIXED_FRAME is not None:
+        z = FIXED_FRAME - 1 if FRAME_ONE_BASED else FIXED_FRAME
+        print(f"\n[Info] Evaluating on fixed frame z={z} "
+              f"(输入={FIXED_FRAME}, one_based={FRAME_ONE_BASED})")
+        gt_img   = keep_only_slice(gt_img, z)
+        base_img = keep_only_slice(base_img, z)
+        mine_img = keep_only_slice(mine_img, z)
+
     print("\n=== Baseline vs GT ===")
-    res_b = evaluate_pair(base_path, gt_path)
-    for k,v in res_b.items(): print(f"{k:>5}: {v:.6g}")
+    res_b = evaluate_pair(base_img, gt_img)
+    for k, v in res_b.items(): print(f"{k:>5}: {v:.6g}")
 
     print("\n=== Mine vs GT ===")
-    res_m = evaluate_pair(mine_path, gt_path)
-    for k,v in res_m.items(): print(f"{k:>5}: {v:.6g}")
+    res_m = evaluate_pair(mine_img, gt_img)
+    for k, v in res_m.items(): print(f"{k:>5}: {v:.6g}")
 
     print("\n=== Summary ===")
     print("Metric     Baseline      Mine")
-    for k in ["Dice","IoU","HD","HD95"]:
-        bv, mv = res_b[k], res_m[k]
-        print(f"{k:<8}  {bv:>10.6g}  {mv:>10.6g}")
+    for k in ["Dice", "IoU", "HD", "HD95"]:
+        print(f"{k:<8}  {res_b[k]:>10.6g}  {res_m[k]:>10.6g}")
 
 if __name__ == "__main__":
     main()

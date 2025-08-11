@@ -1,104 +1,100 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dump baseline best-frame 2D masks from 3D output.mha to PNG images.
+Single-case best-frame PNG dumper with hardcoded paths.
 
-Expected baseline structure per case:
-  <baseline_out>/<case_id>/
-    fetal-abdomen-frame-number.json
-    images/fetal-abdomen-segmentation/output.mha
-
-This script reads the chosen frame index from JSON, slices the 3D mask, binarizes (>0),
-and saves: <out_dir>/<prefix><case_id>_s{frame:03d}.png
+Layout (example):
+  output_mha/
+    aspp/a38f_s304_pred_new.mha
+    baseline/fetal-abdomen-frame-number.json
+    baseline/output_frame304.mha
 
 Usage:
-  python dump_baseline_best_frames.py     --baseline_out /path/to/baseline_outputs     --out_dir preds_base     [--prefix base_]
-把 baseline 的 output.mha + frame-number.json 转成单帧 PNG 掩码，命名为 CaseID_s{frame}.png，
-与 GT 命名对齐，之后就能和新模型 PNG 直接比。
+  python dump_baseline_best_frames_single.py
 """
-import argparse
-from pathlib import Path
+import re
 import json
+from pathlib import Path
 import numpy as np
 import cv2
 
 try:
     import SimpleITK as sitk
 except Exception as e:
-    sitk = None
+    raise SystemExit(f"SimpleITK is required but not available: {e}")
 
-def dump_case(case_dir: Path, out_dir: Path, prefix: str = "") -> bool:
-    """Return True on success, False on skip."""
-    json_path = case_dir / "fetal-abdomen-frame-number.json"
-    mha_path  = case_dir / "images" / "fetal-abdomen-segmentation" / "output.mha"
-    case_name = case_dir.name
+# ====== EDIT THESE CONSTANTS (if needed) ======
+BASELINE_JSON = Path("output_mha/baseline/fetal-abdomen-frame-number.json")
+BASELINE_MHA  = Path("output_mha/baseline/output_frame304.mha")
+ASPP_MHA      = Path("output_mha/aspp/a38f_s304_pred_new.mha")  # optional, used to infer CASE_ID if empty
+OUT_DIR       = Path("output_png/baseline")
+CASE_ID       = ""   # if empty, will try to infer from ASPP_MHA or BASELINE_MHA filename
+PREFIX        = ""   # optional filename prefix
+# =============================================
 
-    if not json_path.exists():
-        print(f"[WARN] {case_name}: missing frame json -> {json_path}")
-        return False
+def infer_case_id() -> str:
+    # Try from aspp filename like a38f_s304_pred_new.mha → "a38f"
+    for p in [ASPP_MHA, BASELINE_MHA]:
+        if p and p.exists():
+            m = re.match(r"([A-Za-z0-9-]+)_s\d+", p.stem)
+            if m:
+                return m.group(1)
+            # fallback: use stem before any suffix words
+            return p.stem.split("_")[0]
+    return "case"
+
+def infer_frame_from_filename(p: Path):
+    """Extract frame index from names like *_s304* or *frame304*; return int or None."""
+    m = re.search(r"(?:_s|frame)(\d+)", p.stem, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def read_volume(mha_path: Path) -> np.ndarray:
     if not mha_path.exists():
-        print(f"[WARN] {case_name}: missing output.mha -> {mha_path}")
-        return False
-
-    try:
-        with open(json_path) as f:
-            frame = int(json.load(f))
-    except Exception as e:
-        print(f"[WARN] {case_name}: cannot parse frame json: {e}")
-        return False
-
-    if sitk is None:
-        print(f"[ERROR] SimpleITK not available; cannot read {mha_path}")
-        return False
-
-    try:
-        itk_img = sitk.ReadImage(str(mha_path))
-        arr3d = sitk.GetArrayFromImage(itk_img)  # (Z, H, W)
-    except Exception as e:
-        print(f"[WARN] {case_name}: cannot read MHA: {e}")
-        return False
-
-    z = arr3d.shape[0]
-    if frame < 0 or frame >= z:
-        print(f"[WARN] {case_name}: frame {frame} out of range (Z={z})")
-        return False
-
-    mask2d = (arr3d[frame] > 0).astype(np.uint8) * 255
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = f"{prefix}{case_name}_s{frame:03d}.png"
-    out_path = out_dir / out_name
-    ok = cv2.imwrite(str(out_path), mask2d)
-    if not ok:
-        print(f"[WARN] {case_name}: failed to write {out_path}")
-        return False
-
-    print(f"[✓] {case_name}: frame {frame} -> {out_path}")
-    return True
+        raise FileNotFoundError(mha_path)
+    itk_img = sitk.ReadImage(str(mha_path))
+    return sitk.GetArrayFromImage(itk_img)  # (Z, H, W)
 
 def main():
-    ap = argparse.ArgumentParser("Dump baseline best-frame PNG masks")
-    ap.add_argument("--baseline_out", required=True, help="Baseline output root containing per-case folders")
-    ap.add_argument("--out_dir", required=True, help="Directory to save PNG masks")
-    ap.add_argument("--prefix", default="", help="Optional filename prefix")
-    args = ap.parse_args()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_root = Path(args.baseline_out)
-    out_dir   = Path(args.out_dir)
+    case_id = CASE_ID or infer_case_id()
+    frame = None
 
-    if not base_root.exists():
-        print(f"[ERROR] baseline_out not found: {base_root}")
-        return
+    # 1) preferred: JSON frame
+    if BASELINE_JSON.exists():
+        try:
+            with open(BASELINE_JSON) as f:
+                frame = int(json.load(f))
+            print(f"[info] frame from JSON: {frame}")
+        except Exception as e:
+            print(f"[warn] cannot parse JSON: {e}")
 
-    case_dirs = [p for p in base_root.iterdir() if p.is_dir()]
-    if not case_dirs:
-        print(f"[ERROR] No case folders found under {base_root}")
-        return
+    # 2) try parse from filename
+    if frame is None:
+        frame = infer_frame_from_filename(BASELINE_MHA)
+        if frame is not None:
+            print(f"[info] frame from filename: {frame}")
 
-    ok = 0
-    for case_dir in sorted(case_dirs):
-        ok += int(dump_case(case_dir, out_dir, args.prefix))
+    # 3) read baseline volume
+    vol = read_volume(BASELINE_MHA)
+    z = vol.shape[0]
 
-    print(f"[DONE] Converted {ok}/{len(case_dirs)} cases to PNG. Output -> {out_dir}")
+    # 4) fallback: max area slice
+    if frame is None:
+        areas = [(vol[i] > 0).sum() for i in range(z)]
+        frame = int(np.argmax(areas))
+        print(f"[info] frame by max area: {frame}")
+
+    if not (0 <= frame < z):
+        raise ValueError(f"Frame {frame} out of range (Z={z})")
+
+    # 5) write PNG
+    mask2d = (vol[frame] > 0).astype(np.uint8) * 255
+    out_path = OUT_DIR / f"{PREFIX}{case_id}_s{frame:03d}.png"
+    ok = cv2.imwrite(str(out_path), mask2d)
+    if not ok:
+        raise RuntimeError(f"Failed to write {out_path}")
+    print(f"[✓] Saved: {out_path}")
 
 if __name__ == "__main__":
     main()

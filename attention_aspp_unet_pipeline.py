@@ -1,42 +1,59 @@
+# attention_aspp_unet_pipeline.py
+# 改进要点：统一Resize到512；更强的数据增强；Dice+BCE(可切Tversky)；
+# AdamW+weight_decay；AMP+梯度裁剪；TTA；全局阈值校准；稳健后处理与帧选择；早停
+
 import argparse
 import cv2
+import json
+import numpy as np
+from pathlib import Path
+from typing import List
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from pathlib import Path
-from typing import List, Tuple
-from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split
-from albumentations import CLAHE, Compose, HorizontalFlip, MedianBlur, RandomGamma, ToFloat
-from albumentations.pytorch import ToTensorV2
-from albumentations import Resize, ShiftScaleRotate, RandomBrightnessContrast
 
+from albumentations import (
+    CLAHE, Compose, HorizontalFlip, MedianBlur, RandomGamma, ToFloat,
+    Resize, ShiftScaleRotate, RandomBrightnessContrast,
+    ElasticTransform, GridDistortion
+)
+
+from albumentations.pytorch import ToTensorV2
 
 try:
     import SimpleITK as sitk
 except ImportError:
     sitk = None
 
-
-IMG_SIZE = 512            # or 512 if GPU OK
+# ---------------- Common Config ----------------
+SEED = 2025
+IMG_SIZE = 512
 WEIGHT_DECAY = 5e-4
+GRAD_CLIP = 1.0
+EARLY_STOP_PATIENCE = 15
 
-# 损失选择：'combo' 用 Dice+BCE；'tversky' 用 Tversky
-LOSS_TYPE = 'combo'       # 'combo' | 'tversky'
+# 损失：'combo'使用 Dice+BCE；'tversky'使用Tversky
+LOSS_TYPE = 'combo'   # 'combo' | 'tversky'
 TV_ALPHA, TV_BETA = 0.7, 0.3
 
+def set_seed(seed=SEED):
+    import random, os
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
-# --- Patch: remove deprecated "always_apply" ---
+# 处理老版本 albumentations 的 always_apply 参数
 def SafeCLAHE(*args, **kwargs):
     kwargs.pop("always_apply", None)
     return CLAHE(*args, **kwargs)
-
 def SafeMedianBlur(*args, **kwargs):
     kwargs.pop("always_apply", None)
     return MedianBlur(*args, **kwargs)
 
-# --- Model ---
+# ---------------- Model ----------------
 class ConvBNReLU(nn.Module):
     def __init__(self, in_c, out_c, k=3):
         super().__init__()
@@ -78,9 +95,7 @@ class AttentionGate(nn.Module):
         return x * self.psi(psi)
 
 class DummyAttention(nn.Module):
-    def forward(self, g, x):
-        return x
-
+    def forward(self, g, x): return x
 
 class UpBlock(nn.Module):
     def __init__(self, in_c, out_c, use_att=True):
@@ -88,10 +103,9 @@ class UpBlock(nn.Module):
         self.up = nn.ConvTranspose2d(in_c, out_c, 2, stride=2)
         self.att = AttentionGate(out_c, out_c, out_c // 2) if use_att else DummyAttention()
         self.conv = nn.Sequential(ConvBNReLU(in_c, out_c), ConvBNReLU(out_c, out_c))
-
     def forward(self, g, x):
         g = self.up(g)
-        if g.shape[-2:] != x.shape[-2:]:  # 防止尺寸不匹配
+        if g.shape[-2:] != x.shape[-2:]:
             g = F.interpolate(g, size=x.shape[-2:], mode="bilinear", align_corners=False)
         x = self.att(g, x)
         return self.conv(torch.cat([x, g], dim=1))
@@ -124,7 +138,8 @@ class AttentionASPPUNet(nn.Module):
         d2 = self.u2(d3, x2)
         d1 = self.u1(d2, x1)
         return self.out_conv(d1)
-# --- Dataset ---
+
+# ---------------- Dataset ----------------
 class FetalACDataset(Dataset):
     def __init__(self, img_paths: List[Path], msk_paths: List[Path] | None, train=True):
         self.img_paths = img_paths
@@ -133,19 +148,30 @@ class FetalACDataset(Dataset):
         self.transform = self._build_transform()
 
     def _build_transform(self):
-        # 先做几何，再做强度增强，最后转tensor
+        # 几何增强先于强度增强
+        # 训练增强里：用 Affine 代替 ShiftScaleRotate；去掉 ElasticTransform 的 alpha_affine
+        from albumentations import Affine, ElasticTransform
+
         t_train = [
             Resize(IMG_SIZE, IMG_SIZE),
             HorizontalFlip(p=0.5),
-            ShiftScaleRotate(shift_limit=0.02, scale_limit=0.08, rotate_limit=7,
-                             border_mode=cv2.BORDER_REFLECT_101, p=0.7),
+            Affine(
+                scale=(0.92, 1.08),
+                rotate=(-7, 7),
+                translate_percent=(0.0, 0.02),
+                shear=0,  # ← 关键：不要用 None
+                fit_output=False,
+                p=0.7
+            ),
             RandomGamma((80, 120), p=0.3),
             RandomBrightnessContrast(0.1, 0.1, p=0.3),
+            ElasticTransform(alpha=8, sigma=3, p=0.25),  # 不要再传 alpha_affine
             SafeCLAHE(1.0, (8, 8)),
             SafeMedianBlur(3),
             ToFloat(max_value=255.0),
             ToTensorV2()
         ]
+
         t_val = [
             Resize(IMG_SIZE, IMG_SIZE),
             SafeCLAHE(1.0, (8, 8)),
@@ -170,17 +196,20 @@ class FetalACDataset(Dataset):
         msk = np.zeros_like(img)
         if self.msk_paths: msk = self._read(self.msk_paths[idx])
         sample = self.transform(image=img, mask=msk)
+        # 归一化到[0,1]后转 tensor
         return sample["image"].float(), (sample["mask"].unsqueeze(0).float() / 255.0)
 
-
-# --- Utility ---
+# ---------------- Utils ----------------
 def collect_pairs(img_dir: Path, msk_dir: Path | None):
     exts = {'.png', '.jpg', '.jpeg', '.tif', '.bmp', '.mha'}
     imgs, msks = [], []
     for p in sorted(img_dir.iterdir()):
         if p.suffix.lower() not in exts: continue
         imgs.append(p)
-        if msk_dir: msks.append(msk_dir/p.name)
+        if msk_dir:
+            q = msk_dir/p.name
+            if q.exists(): msks.append(q)
+            else: msks.append(None)
     return imgs, msks if msk_dir else None
 
 class DiceLoss(nn.Module):
@@ -204,7 +233,7 @@ class TverskyLoss(nn.Module):
         return (1 - tversky).mean()
 
 class ComboLoss(nn.Module):
-    """Dice + BCE；更稳，能缓解保守收缩"""
+    """Dice + BCE：提升召回且抑制边界收缩"""
     def __init__(self, dice_w=1.0, bce_w=1.0):
         super().__init__()
         self.dice = DiceLoss()
@@ -214,12 +243,61 @@ class ComboLoss(nn.Module):
         b = F.binary_cross_entropy_with_logits(logits, targets)
         return self.dw*d + self.bw*b
 
-
 def iou_score(logits, targets, thresh=0.5):
     preds = (torch.sigmoid(logits) > thresh).float()
     inter = (preds * targets).sum((2, 3))
     union = preds.sum((2, 3)) + targets.sum((2, 3)) - inter
     return (inter / (union + 1e-7)).mean().item()
+
+from scipy.ndimage import distance_transform_edt
+
+class EdgeLoss(nn.Module):
+    """用Sobel对概率图与GT的梯度做L1，AMP 兼容"""
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=torch.float32).view(1,1,3,3)
+        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=torch.float32).view(1,1,3,3)
+        self.register_buffer("kx", kx)
+        self.register_buffer("ky", ky)
+
+    def forward(self, logits, targets):
+        # logits 可能是 float16（AMP）；把核和 targets 都匹配到同 dtype/device
+        p = torch.sigmoid(logits)
+        dtype = p.dtype
+        device = p.device
+        kx = self.kx.to(device=device, dtype=dtype)
+        ky = self.ky.to(device=device, dtype=dtype)
+        t = targets.to(dtype=dtype, device=device)
+
+        gx_p = F.conv2d(p, kx, padding=1); gy_p = F.conv2d(p, ky, padding=1)
+        gx_t = F.conv2d(t, kx, padding=1); gy_t = F.conv2d(t, ky, padding=1)
+        grad_p = torch.sqrt(gx_p**2 + gy_p**2 + 1e-8)
+        grad_t = torch.sqrt(gx_t**2 + gy_t**2 + 1e-8)
+        return F.l1_loss(grad_p, grad_t)
+
+
+def _dist_weight(targets):
+    """基于距离变换的权重，边界附近权重大，降低HD95"""
+    y = targets.detach().cpu().numpy()
+    ws = []
+    for t in y:  # t: (1,H,W)
+        t2 = t[0]
+        pos = distance_transform_edt(t2)
+        neg = distance_transform_edt(1 - t2)
+        dist = pos + neg
+        w = dist / (dist.max() + 1e-8)
+        ws.append(w)
+    w = torch.from_numpy(np.stack(ws)).to(targets.device).unsqueeze(1).float()
+    return w
+
+class SurfaceLoss(nn.Module):
+    """距离加权的BCE，逼近surface/boundary类损失"""
+    def __init__(self, lam=0.5):
+        super().__init__(); self.lam = lam
+    def forward(self, logits, targets):
+        w = 1.0 + self.lam * _dist_weight(targets)
+        return F.binary_cross_entropy_with_logits(logits, targets, weight=w)
+
 
 @torch.inference_mode()
 def evaluate(model, loader, device):
@@ -232,11 +310,12 @@ def evaluate(model, loader, device):
         iou  += iou_score(logits, y)
     return dice/len(loader), iou/len(loader)
 
-# --- Train ---
 def train(args):
+    set_seed()
     root_train = Path("train_png_best")
     root_val = Path("val_png_best")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     train_imgs, train_msks = collect_pairs(root_train/"images", root_train/"masks")
 
     if (root_val/"images").exists():
@@ -245,66 +324,108 @@ def train(args):
         val_ds   = FetalACDataset(val_imgs, val_msks, train=False)
     else:
         full_ds = FetalACDataset(train_imgs, train_msks, train=True)
-        val_len = int(0.1 * len(full_ds))
+        val_len = max(1, int(0.1 * len(full_ds)))
         train_ds, val_ds = random_split(full_ds, [len(full_ds)-val_len, val_len])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    model = AttentionASPPUNet().to(device)
+    model = AttentionASPPUNet(base_c=args.base_c).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = ComboLoss() if LOSS_TYPE == 'combo' else TverskyLoss(TV_ALPHA, TV_BETA)
+    # Warmup + Cosine
+    total_epochs = args.epochs
+    warmup_epochs = max(1, int(0.05 * total_epochs))
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.2, total_iters=warmup_epochs), cosine],
+        milestones=[warmup_epochs]
+    )
+
+    # 损失（基础+边界），SurfaceLoss 先不启用，稳定后再加
+    base_loss = ComboLoss() if LOSS_TYPE == 'combo' else TverskyLoss(TV_ALPHA, TV_BETA)
+    edge_loss = EdgeLoss()
+
+    def criterion_fn(logit_map, y):
+        logit_map = logit_map.float()
+        y = y.float()
+        return base_loss(logit_map, y) + args.edge_w * edge_loss(logit_map, y)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    best = 0.0
+    best = 0.0; best_path = out_dir/"best.pt"
+    no_improve = 0
 
-    for ep in range(1, args.epochs+1):
-        model.train(); running_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {ep}/{args.epochs}")
-        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    for ep in range(1, total_epochs + 1):
+        model.train(); running = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {ep}/{total_epochs}")
         for x, y in pbar:
             x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                logits = model(x)
-                loss = criterion(logits, y)
+                logit_map = model(x)
+                loss = criterion_fn(logit_map, y)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            running_loss += loss.item()
-            pbar.set_postfix(loss=f"{running_loss / (pbar.n + 1):.4f}")
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer); scaler.update()
+            running += loss.item()
+            pbar.set_postfix(loss=f"{running/(pbar.n+1):.4f}")
         scheduler.step()
+
         dice, iou = evaluate(model, val_loader, device)
         print(f"\n[Val] Dice: {dice:.4f} | IoU: {iou:.4f}")
-        if dice > best:
-            best = dice
-            torch.save(model.state_dict(), out_dir / "best.pt")
-            print("[✓] Best model saved.")
 
-# --- Predict ---
+        if dice > best:
+            best = dice; no_improve = 0
+            torch.save(model.state_dict(), best_path)
+            print(f"[✓] Best model saved to {best_path}")
+        else:
+            no_improve += 1
+            if no_improve >= EARLY_STOP_PATIENCE:
+                print("[EarlyStop] no improvement, stop training.")
+                break
+
+# ---------------- Predict ----------------
 from skimage.measure import label
 from scipy.ndimage import binary_fill_holes
 
-def predict_prob(model, x):
-    """x: (1,1,H,W) tensor"""
+def predict_prob_tta(model, x):
+    """TTA：原图+水平翻转"""
     logits = model(x)
-    # TTA: 水平翻转
     x_flip = torch.flip(x, dims=[-1])
     logits_flip = model(x_flip)
     logits_flip = torch.flip(logits_flip, dims=[-1])
-    logits = (logits + logits_flip) / 2
-    return torch.sigmoid(logits).cpu().numpy()[0,0]
+    logits = (logits + logits_flip) / 2.0
+    return torch.sigmoid(logits).cpu().numpy()[0, 0]
+
+def otsu_on_prob(prob):
+    """备用：对[0,1]概率图做 Otsu，自适应阈值并夹到[0.35,0.6]"""
+    p8 = np.clip(prob * 255.0, 0, 255).astype(np.uint8)
+    ret, _ = cv2.threshold(p8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = ret / 255.0
+    thr = max(0.35, min(0.6, float(thr)))
+    return thr
 
 def refine_mask(mask01: np.ndarray) -> np.ndarray:
+    """小面积滤除 + 最大连通域 + (7,7)闭运算 + 填洞"""
     if mask01.sum()==0: return mask01
     lab = label(mask01)
-    cnt = np.bincount(lab.ravel())
-    cnt[0] = 0
-    keep = cnt.argmax()
-    m = (lab == keep).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    cnt = np.bincount(lab.ravel()); cnt[0] = 0
+
+    H, W = mask01.shape
+    min_area = max(20, int(0.0015 * H * W))   # 过滤极小噪点（~0.15%图像）
+    keep_ids = [i for i,c in enumerate(cnt) if c >= min_area]
+    if not keep_ids: return np.zeros_like(mask01)
+    m = np.isin(lab, keep_ids).astype(np.uint8)
+
+    # 只保留面积最大的那块
+    lab2 = label(m); cnt2 = np.bincount(lab2.ravel()); cnt2[0]=0
+    m = (lab2 == int(np.argmax(cnt2))).astype(np.uint8)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=1)
     m = binary_fill_holes(m).astype(np.uint8)
     return m
@@ -320,129 +441,189 @@ def circularity(mask01: np.ndarray) -> float:
 def select_best_frame(pred_stack: np.ndarray, topk: int = 5) -> int:
     """先按面积取 topk，再按圆度最大挑一帧"""
     areas = np.array([(m>0).sum() for m in pred_stack])
-    idxs = areas.argsort()[::-1][:topk]
+    idxs = areas.argsort()[::-1][:max(1, min(topk, len(areas)))]
     best = max(idxs, key=lambda i: circularity(pred_stack[i]))
     return int(best)
 
 @torch.inference_mode()
-def predict(args):
+def calibrate(args):
+    """在验证集上网格搜索全局阈值，写 thr.json"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AttentionASPPUNet(); model.load_state_dict(torch.load(args.weights, map_location=device))
+    model = AttentionASPPUNet(base_c=args.base_c)
+    model.load_state_dict(torch.load(args.weights, map_location=device))
+    model.to(device).eval()
+
+    val_img_dir = Path(args.val_dir)/"images"
+    val_msk_dir = Path(args.val_dir)/"masks"
+    img_paths = sorted(val_img_dir.glob("*.png"))
+
+    thrs = np.linspace(0.35, 0.60, 11)
+    scores = []
+
+    for thr in thrs:
+        dices = []
+        for p in img_paths:
+            sl = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=sl)
+            x = sample["image"].unsqueeze(0).to(device)
+            prob = predict_prob_tta(model, x)
+            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
+            prob = cv2.GaussianBlur(prob, (5,5), 0)   # 阈值前平滑
+            m = (prob > float(thr)).astype(np.uint8)
+
+            gt = cv2.imread(str(val_msk_dir/p.name), cv2.IMREAD_GRAYSCALE)
+            gt = (gt>127).astype(np.uint8)
+            inter = (m & gt).sum()
+            dice = (2*inter) / (m.sum() + gt.sum() + 1e-7)
+            dices.append(dice)
+        scores.append(np.mean(dices))
+
+    best_thr = float(thrs[int(np.argmax(scores))])
+    out = {"best_thr": best_thr}
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(args.output_dir)/"thr.json", "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"[✓] Calibrated threshold = {best_thr:.3f} (saved to thr.json)")
+
+@torch.inference_mode()
+def predict(args):
+    set_seed()
+
+    # 读取全局阈值
+    thr_cfg = Path("./checkpoints/thr.json")
+    GLOBAL_THR = 0.48
+    if thr_cfg.exists():
+        try:
+            with open(thr_cfg, "r") as f:
+                GLOBAL_THR = float(json.load(f)["best_thr"])
+            print(f"[i] Use calibrated threshold: {GLOBAL_THR:.3f}")
+        except Exception:
+            pass
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AttentionASPPUNet(base_c=args.base_c)
+    model.load_state_dict(torch.load(args.weights, map_location=device))
+
+    model.load_state_dict(torch.load(args.weights, map_location=device))
     model.to(device).eval()
 
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    pred_probs = []
     for img_path in sorted(input_dir.iterdir()):
-        if img_path.suffix.lower() in {'.png', '.jpg', '.jpeg'}:
-            # === 用 OpenCV 正确读取 PNG 图像 ===
-            sl = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)  # shape: (H, W)
+        ext = img_path.suffix.lower()
+        if ext in {'.png', '.jpg', '.jpeg'}:
+            # 读2D
+            sl = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
             sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
             enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
 
-            sample = Compose([ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
-            x = sample["image"].unsqueeze(0).to(device)  # shape: (1, 1, H, W)
-
-            THR = 0.45  # 全局阈值可微调 0.45~0.5
-
-            pred = predict_prob(model, x)
-            mask = (pred > THR).astype(np.uint8)
-            mask = refine_mask(mask)
-
-            out_path = out_dir / f"{img_path.stem}_mask.png"
-            cv2.imwrite(str(out_path), mask * 255)
-            print(f"[✓] Saved: {out_path}")
-
-        elif img_path.suffix.lower() == '.mha':
-            sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
-            enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+            # Resize到训练分辨率
             sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)
-            prob = predict_prob(model, x)  # (H',W') 概率
-            # 还原回原分辨率
-            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]), interpolation=cv2.INTER_LINEAR)
-            pred_probs.append(prob)
 
-    pred_probs = np.stack(pred_probs)  # (N,H,W)
+            prob = predict_prob_tta(model, x)                    # (H',W')
+            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))  # 还原
+            prob = cv2.GaussianBlur(prob, (5,5), 0)              # 阈值前平滑
 
-    # 阈值 + 后处理
-    pred_masks = []
-    for p in pred_probs:
-        m = (p > THR).astype(np.uint8)
-        m = refine_mask(m)
-        pred_masks.append(m)
-    pred_stack = np.stack(pred_masks)
+            thr = GLOBAL_THR
+            m = (prob > thr).astype(np.uint8)
+            mask = refine_mask(m)
 
-    # 更稳的帧选择
-    best_frame = select_best_frame(pred_stack, topk=5)
-    best_mask = pred_stack[best_frame]
+            cv2.imwrite(str(out_dir / f"{img_path.stem}_mask.png"), mask * 255)
+            print(f"[✓] Saved: {img_path.stem}_mask.png")
 
-    write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
+        elif ext == '.mha':
+            if sitk is None:
+                raise ImportError("SimpleITK is required for .mha processing.")
+            # 读3D并逐帧推理
+            vol = sitk.GetArrayFromImage(sitk.ReadImage(str(img_path)))  # (N,H,W)
+            pred_masks = []
+            for sl in vol:
+                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+                enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+                sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
+                x = sample["image"].unsqueeze(0).to(device)
 
+                prob = predict_prob_tta(model, x)                        # (H',W')
+                prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))      # 还原
+                prob = cv2.GaussianBlur(prob, (5,5), 0)                  # 阈值前平滑
 
-# --- CLI ---
-def get_args():
-    p = argparse.ArgumentParser("Attention-ASPP-UNet")
-    sp = p.add_subparsers(dest="cmd", required=True)
-    t = sp.add_parser("train")
-    t.add_argument("--data_dir", required=True)
-    t.add_argument("--output_dir", default="./checkpoints")
-    t.add_argument("--epochs", type=int, default=120)
-    t.add_argument("--batch_size", type=int, default=8)
-    t.add_argument("--lr", type=float, default=3e-4)
-    pr = sp.add_parser("predict")
-    pr.add_argument("--weights", required=True)
-    pr.add_argument("--input_dir", required=True)
-    pr.add_argument("--out_dir", default="./preds")
-    return p.parse_args()
+                thr = GLOBAL_THR
+                m = (prob > thr).astype(np.uint8)
+                mask = refine_mask(m)
+                pred_masks.append(mask)
 
+            pred_stack = np.stack(pred_masks)                            # (N,H,W)
+            best_frame = select_best_frame(pred_stack, topk=5)
+            best_mask = pred_stack[best_frame]
+            write_output_mha_and_json(best_mask, best_frame, img_path, out_dir)
 
-import SimpleITK as sitk
-import json
-
+# ---------------- I/O helpers for challenge ----------------
 def convert_mask_2d_to_3d(mask_2d: np.ndarray, frame: int, total_frames: int):
-    mask_2d = (mask_2d > 0).astype(np.uint8) * 2  # 保持 ITK-SNAP 绿色
+    mask_2d = (mask_2d > 0).astype(np.uint8) * 2  # ITK-SNAP绿色标签=2
     mask_3d = np.zeros((total_frames, *mask_2d.shape), dtype=np.uint8)
     if 0 <= frame < total_frames:
         mask_3d[frame] = mask_2d
     return mask_3d
 
-
 def write_output_mha_and_json(mask_2d: np.ndarray, frame: int, reference_mha_path: Path, output_dir: Path):
     case_name = reference_mha_path.stem
     case_out_dir = output_dir / case_name
-
-    # 读取参考原图
     ref_img = sitk.ReadImage(str(reference_mha_path))
-    total_frames = ref_img.GetSize()[2]  # 获取 Z 轴帧数（必须匹配）
+    total_frames = ref_img.GetSize()[2]
 
-    # 构造掩码 3D
     mask_3d = convert_mask_2d_to_3d(mask_2d, frame, total_frames)
-
-    # 构造 sitk image + metadata
     output_img = sitk.GetImageFromArray(mask_3d)
     output_img.CopyInformation(ref_img)
 
-    # 写入 .mha
     output_mha_path = case_out_dir / "images/fetal-abdomen-segmentation/output.mha"
     output_mha_path.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(output_img, str(output_mha_path))
 
-    # 写入 JSON
     json_path = case_out_dir / "fetal-abdomen-frame-number.json"
     with open(json_path, "w") as f:
         json.dump(frame, f, indent=2)
 
     print(f"[✓] {case_name} → output.mha (frame {frame})")
 
+# ---------------- CLI ----------------
+def get_args():
+    p = argparse.ArgumentParser("Attention-ASPP-UNet")
+    sp = p.add_subparsers(dest="cmd", required=True)
 
+    t = sp.add_parser("train")
+    t.add_argument("--data_dir", required=True)
+    t.add_argument("--output_dir", default="./checkpoints")
+    t.add_argument("--epochs", type=int, default=120)
+    t.add_argument("--batch_size", type=int, default=8)
+    t.add_argument("--lr", type=float, default=3e-4)
+    t.add_argument("--base_c", type=int, default=48)
+    t.add_argument("--edge_w", type=float, default=0.05, help="边界损失权重，0~0.1之间可调")
+
+    pr = sp.add_parser("predict")
+    pr.add_argument("--weights", required=True)
+    pr.add_argument("--input_dir", required=True)
+    pr.add_argument("--out_dir", default="./preds")
+    pr.add_argument("--base_c", type=int, default=48)
+
+    ca = sp.add_parser("calibrate")
+    ca.add_argument("--weights", required=True)
+    ca.add_argument("--val_dir", required=True)    # e.g. ./val_png_best
+    ca.add_argument("--output_dir", default="./checkpoints")
+    ca.add_argument("--base_c", type=int, default=48)
+
+    return p.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
     torch.backends.cudnn.benchmark = True
-    if args.cmd == "train": train(args)
-    elif args.cmd == "predict": predict(args)
+    if args.cmd == "train":
+        train(args)
+    elif args.cmd == "predict":
+        predict(args)
+    elif args.cmd == "calibrate":
+        calibrate(args)
