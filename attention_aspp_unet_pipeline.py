@@ -464,7 +464,10 @@ def calibrate(args):
         dices = []
         for p in img_paths:
             sl = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-            sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=sl)
+            sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+            enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
+            sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)
             prob = predict_prob_tta(model, x)
             prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
@@ -502,8 +505,6 @@ def predict(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionASPPUNet(base_c=args.base_c)
-    model.load_state_dict(torch.load(args.weights, map_location=device))
-
     model.load_state_dict(torch.load(args.weights, map_location=device))
     model.to(device).eval()
 
