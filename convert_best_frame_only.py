@@ -5,6 +5,7 @@ import imageio
 import cv2
 import json
 from tqdm import tqdm
+import csv  # NEW: 写 mapping.csv 用
 
 def convert_best_frame_only(mha_root: str, out_root: str):
     mha_root = Path(mha_root)
@@ -48,11 +49,23 @@ def convert_best_frame_only(mha_root: str, out_root: str):
         frame_dict[name] = best_idx  # ✅ 记录最佳帧编号
 
     # 保存 JSON 文件
+    # 保存 JSON 文件
     json_path = out_msk / "best_frame_indices.json"
     with open(json_path, "w") as f:
         json.dump(frame_dict, f, indent=2)
 
-    print(f'✅ {mha_root} → {out_root}（仅最佳帧）完成，共处理 {len(frame_dict)} 个样本')
+    # NEW: 额外保存 CSV 映射（case_id,best_frame_idx）
+    csv_path = Path(out_root) / "mapping.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["case_id", "best_frame_idx"])
+        for case_id, idx in sorted(frame_dict.items()):
+            w.writerow([case_id, idx])
+
+    print(f'{mha_root} → {out_root}（仅最佳帧）完成，共处理 {len(frame_dict)} 个样本')
+    print(f'已写出: {csv_path}')
+
+    print(f'{mha_root} → {out_root}（仅最佳帧）完成，共处理 {len(frame_dict)} 个样本')
 
 # 示例调用
 if __name__ == "__main__":

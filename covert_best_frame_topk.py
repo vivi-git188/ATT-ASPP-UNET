@@ -6,6 +6,8 @@ import cv2
 import json
 from tqdm import tqdm
 
+
+# 推理时固定 topk=1, neighbor_pad=0
 def convert_best_frame_only(mha_root: str, out_root: str, topk: int = 3, neighbor_pad: int = 0):
     mha_root = Path(mha_root)
     out_img = Path(out_root, 'images'); out_img.mkdir(parents=True, exist_ok=True)
