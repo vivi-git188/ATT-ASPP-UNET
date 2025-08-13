@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from albumentations import (
     CLAHE, Compose, HorizontalFlip, MedianBlur, RandomGamma, ToFloat,
     Resize, ShiftScaleRotate, RandomBrightnessContrast,
-    ElasticTransform, GridDistortion
+    ElasticTransform, GridDistortion, VerticalFlip, MotionBlur
 )
 
 from albumentations.pytorch import ToTensorV2
@@ -41,18 +41,29 @@ EARLY_STOP_PATIENCE = 15
 LOSS_TYPE = 'combo'   # 'combo' | 'tversky'
 TV_ALPHA, TV_BETA = 0.7, 0.3
 
+# ---- 兼容各版本 Albumentations 的随机种子设置 ----
 def set_seed(seed=SEED):
+    import os, random
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    print(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-    A.seed_everything(seed)  # ← 固定 Albumentations
+
+    # Albumentations: 旧版本用 core.utils.set_seed，新版本是 albumentations.set_seed
+    try:
+        try:
+            from albumentations import set_seed as A_set_seed
+        except Exception:
+            from albumentations.core.utils import set_seed as A_set_seed
+        A_set_seed(seed)
+    except Exception as e:
+        print(f"[warn] skip albumentations seeding: {e}")
 
 def seed_worker(worker_id):
-    # 让每个 dataloader worker 拿到可复现的 numpy/random 种子
-    worker_seed = SEED + worker_id
+    # 用 PyTorch 分配给每个 worker 的初始种子，避免和主进程重复
+    worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
 
 # 处理老版本 albumentations 的 always_apply 参数
 def SafeCLAHE(*args, **kwargs):
@@ -63,15 +74,44 @@ def SafeMedianBlur(*args, **kwargs):
     return MedianBlur(*args, **kwargs)
 
 # ---------------- Model ----------------
+class SE(nn.Module):
+    """Squeeze-and-Excitation，减少通道冗余"""
+    def __init__(self, c, r=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c // r, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c // r, c, 1, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.fc(x)
+
 class ConvBNReLU(nn.Module):
     def __init__(self, in_c, out_c, k=3):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_c, out_c, k, padding=k//2, bias=False),
+            nn.Conv2d(in_c, out_c, k, padding=k // 2, bias=False),
             nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            SE(out_c)               # <-- 新增
         )
-    def forward(self, x): return self.block(x)
+    def forward(self, x):
+        return self.block(x)
+
+class DiceFocalLoss(nn.Module):
+    """Dice + Focal BCE（α=0.25, γ=2）"""
+    def __init__(self, alpha=0.25, gamma=2):
+        super().__init__()
+        self.dice  = DiceLoss()
+        self.alpha = alpha
+        self.gamma = gamma
+    def forward(self, logits, targets):
+        p = torch.sigmoid(logits)
+        bce   = F.binary_cross_entropy(p, targets, reduction='none')
+        focal = self.alpha * (1 - p) ** self.gamma * bce
+        return self.dice(logits, targets) + focal.mean()
 
 class ASPP(nn.Module):
     def __init__(self, in_c, out_c=256, rates=(6,12,18)):
@@ -164,17 +204,14 @@ class FetalACDataset(Dataset):
         t_train = [
             Resize(IMG_SIZE, IMG_SIZE),
             HorizontalFlip(p=0.5),
-            Affine(
-                scale=(0.92, 1.08),
-                rotate=(-7, 7),
-                translate_percent=(0.0, 0.02),
-                shear=0,  # ← 关键：不要用 None
-                fit_output=False,
-                p=0.7
-            ),
+            VerticalFlip(p=0.1),  # 新增纵向翻转
+            Affine(scale=(0.92, 1.08), rotate=(-7, 7),
+                   translate_percent=(0, 0.02), shear=0, p=0.7),
+            A.GaussNoise(var_limit=(5.0, 15.0), p=0.3),  # 细噪声
             RandomGamma((80, 120), p=0.3),
             RandomBrightnessContrast(0.1, 0.1, p=0.3),
-            ElasticTransform(alpha=8, sigma=3, p=0.25),  # 不要再传 alpha_affine
+            ElasticTransform(alpha=8, sigma=3, p=0.25),
+            MotionBlur(blur_limit=3, p=0.2),  # 轻微模糊
             SafeCLAHE(1.0, (8, 8)),
             SafeMedianBlur(3),
             ToFloat(max_value=255.0),
@@ -320,6 +357,8 @@ def evaluate(model, loader, device):
     return dice/len(loader), iou/len(loader)
 
 def train(args):
+    from torch.optim.swa_utils import AveragedModel
+
     set_seed(args.seed)
     # cuDNN 确定性/基准选择
     torch.backends.cudnn.deterministic = bool(args.deterministic)
@@ -363,14 +402,15 @@ def train(args):
         schedulers=[torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.2, total_iters=warmup_epochs), cosine],
         milestones=[warmup_epochs]
     )
-
+    ema = AveragedModel(model)
     # 损失（基础+边界），SurfaceLoss 先不启用，稳定后再加
-    base_loss = ComboLoss() if LOSS_TYPE == 'combo' else TverskyLoss(TV_ALPHA, TV_BETA)
+    base_loss = DiceFocalLoss()  # ← 换成 Dice+Focal
     edge_loss = EdgeLoss()
+    edge_start = args.edge_start  # 新参数，默认 20
 
-    def criterion_fn(logit_map, y):
-        logit_map = logit_map.float()
-        y = y.float()
+    def criterion_fn(logit_map, y, epoch):
+        if epoch < edge_start:
+            return base_loss(logit_map, y)  # 先只训练主体
         return base_loss(logit_map, y) + args.edge_w * edge_loss(logit_map, y)
 
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
@@ -388,21 +428,25 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 logit_map = model(x)
-                loss = criterion_fn(logit_map, y)
+                loss = criterion_fn(logit_map, y, ep)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer); scaler.update()
+            with torch.no_grad():
+                ema.update_parameters(model)
+
             running += loss.item()
             pbar.set_postfix(loss=f"{running/(pbar.n+1):.4f}")
         scheduler.step()
 
-        dice, iou = evaluate(model, val_loader, device)
+        dice, iou = evaluate(ema.module, val_loader, device)
+
         print(f"\n[Val] Dice: {dice:.4f} | IoU: {iou:.4f}")
 
         if dice > best:
             best = dice; no_improve = 0
-            torch.save(model.state_dict(), best_path)
+            torch.save(ema.module.state_dict(), best_path)
             print(f"[✓] Best model saved to {best_path}")
         else:
             no_improve += 1
@@ -415,13 +459,22 @@ from skimage.measure import label
 from scipy.ndimage import binary_fill_holes
 
 def predict_prob_tta(model, x):
-    """TTA：原图+水平翻转"""
-    logits = model(x)
-    x_flip = torch.flip(x, dims=[-1])
-    logits_flip = model(x_flip)
-    logits_flip = torch.flip(logits_flip, dims=[-1])
-    logits = (logits + logits_flip) / 2.0
-    return torch.sigmoid(logits).cpu().numpy()[0, 0]
+    scales = [1.0, 0.75]
+    flips  = [None, 'h', 'v']
+    probs  = []
+    for s in scales:
+        xs = F.interpolate(x, scale_factor=s, mode='bilinear',
+                           align_corners=False) if s != 1.0 else x
+        for f in flips:
+            xin = torch.flip(xs, dims=[-1]) if f == 'h' else \
+                  torch.flip(xs, dims=[-2]) if f == 'v' else xs
+            p = model(xin)
+            if f:
+                p = torch.flip(p, dims=[-1]) if f == 'h' else torch.flip(p, dims=[-2])
+            p = F.interpolate(p, size=x.shape[-2:], mode='bilinear',
+                              align_corners=False)
+            probs.append(torch.sigmoid(p))
+    return torch.mean(torch.stack(probs), dim=0)[0, 0].cpu().numpy()
 
 def otsu_on_prob(prob):
     """备用：对[0,1]概率图做 Otsu，自适应阈值并夹到[0.35,0.6]"""
@@ -627,10 +680,12 @@ def get_args():
     t.add_argument("--data_dir", required=True)
     t.add_argument("--output_dir", default="./checkpoints")
     t.add_argument("--epochs", type=int, default=120)
-    t.add_argument("--batch_size", type=int, default=8)
+    t.add_argument("--batch_size", type=int, default=4)
     t.add_argument("--lr", type=float, default=3e-4)
-    t.add_argument("--base_c", type=int, default=48)
+    t.add_argument("--base_c", type=int, default=64)
     t.add_argument("--edge_w", type=float, default=0.05, help="边界损失权重，0~0.1之间可调")
+    t.add_argument("--edge_start", type=int, default=20, help="从第 N 个 epoch 开始加入 EdgeLoss")
+    t.add_argument("--edge_w", type=float, default=5.0, help="EdgeLoss 权重")
 
     pr = sp.add_parser("predict")
     pr.add_argument("--seed", type=int, default=SEED)
