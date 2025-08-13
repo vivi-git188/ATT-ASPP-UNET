@@ -1,50 +1,41 @@
-import os
-import cv2
-import numpy as np
+# check_pairs.py
 from pathlib import Path
-from sklearn.metrics import jaccard_score, f1_score
+import sys
 
-def compute_iou(pred, gt):
-    return jaccard_score(gt.flatten(), pred.flatten())
+base = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("train_best")
+img_dir = base / "images"
+msk_dir = base / "masks"
 
-def compute_dice(pred, gt):
-    return f1_score(gt.flatten(), pred.flatten())
+if not img_dir.is_dir() or not msk_dir.is_dir():
+    raise SystemExit(f"目录不存在：{img_dir} 或 {msk_dir}")
 
-def binarize(img):
-    return (img > 127).astype(np.uint8)
+# 仅统计文件（忽略子目录）
+imgs = sorted(p for p in img_dir.iterdir() if p.is_file())
+msks = sorted(p for p in msk_dir.iterdir() if p.is_file())
 
-def evaluate(pred_dir, gt_dir):
-    pred_dir = Path(pred_dir)
-    gt_dir = Path(gt_dir)
+img_stems = {p.stem for p in imgs}
+msk_stems = {p.stem for p in msks}
 
-    dices = []
-    ious = []
+missing_masks = sorted(img_stems - msk_stems)   # images中有而masks中没有
+extra_masks   = sorted(msk_stems - img_stems)   # masks中多出来的
 
-    for pred_file in pred_dir.glob("*_mask.png"):
-        case_id = pred_file.stem.replace("_mask", "")
-        gt_file = gt_dir / f"{case_id}.png"
-        if not gt_file.exists():
-            print(f"[!] Ground truth not found: {gt_file}")
-            continue
+print(f"[Counts]")
+print(f"images: {len(imgs)} files in {img_dir}")
+print(f"masks : {len(msks)} files in {msk_dir}\n")
 
-        pred = binarize(cv2.imread(str(pred_file), cv2.IMREAD_GRAYSCALE))
-        gt   = binarize(cv2.imread(str(gt_file), cv2.IMREAD_GRAYSCALE))
+print(f"[Check] images 中无对应 mask 的文件数：{len(missing_masks)}")
+for s in missing_masks[:50]:
+    print("  -", s)
+if len(missing_masks) > 50:
+    print(f"  ... 还有 {len(missing_masks)-50} 个未显示")
 
-        if pred.shape != gt.shape:
-            print(f"[!] Shape mismatch: {pred_file.name}")
-            continue
+print(f"\n[Check] masks 中无对应 image 的文件数：{len(extra_masks)}")
+for s in extra_masks[:50]:
+    print("  -", s)
+if len(extra_masks) > 50:
+    print(f"  ... 还有 {len(extra_masks)-50} 个未显示")
 
-        dice = compute_dice(pred, gt)
-        iou  = compute_iou(pred, gt)
-        dices.append(dice)
-        ious.append(iou)
-
-        print(f"{case_id}: Dice = {dice:.4f} | IoU = {iou:.4f}")
-
-    print("\n[Summary]")
-    print(f"Average Dice: {np.mean(dices):.4f}")
-    print(f"Average IoU : {np.mean(ious):.4f}")
-
-
-if __name__ == "__main__":
-    evaluate("./preds_fixed_frame", "./val_png_best/masks")
+# 保存清单，便于后续处理
+(out1 := base / "_images_without_masks.txt").write_text("\n".join(missing_masks))
+(out2 := base / "_masks_without_images.txt").write_text("\n".join(extra_masks))
+print(f"\n清单已保存：\n - {out1}\n - {out2}")

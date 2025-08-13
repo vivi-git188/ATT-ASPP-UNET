@@ -22,7 +22,9 @@ from albumentations import (
 )
 
 from albumentations.pytorch import ToTensorV2
-
+from datetime import datetime
+import os, random
+import albumentations as A
 try:
     import SimpleITK as sitk
 except ImportError:
@@ -39,11 +41,29 @@ EARLY_STOP_PATIENCE = 15
 LOSS_TYPE = 'combo'   # 'combo' | 'tversky'
 TV_ALPHA, TV_BETA = 0.7, 0.3
 
+# ---- 兼容各版本 Albumentations 的随机种子设置 ----
 def set_seed(seed=SEED):
-    import random, os
+    import os, random
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # Albumentations: 旧版本用 core.utils.set_seed，新版本是 albumentations.set_seed
+    try:
+        try:
+            from albumentations import set_seed as A_set_seed
+        except Exception:
+            from albumentations.core.utils import set_seed as A_set_seed
+        A_set_seed(seed)
+    except Exception as e:
+        print(f"[warn] skip albumentations seeding: {e}")
+
+def seed_worker(worker_id):
+    # 用 PyTorch 分配给每个 worker 的初始种子，避免和主进程重复
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 # 处理老版本 albumentations 的 always_apply 参数
 def SafeCLAHE(*args, **kwargs):
@@ -311,8 +331,11 @@ def evaluate(model, loader, device):
     return dice/len(loader), iou/len(loader)
 
 def train(args):
-    set_seed()
-    root_train = Path("train_png_best")
+    set_seed(args.seed)
+    # cuDNN 确定性/基准选择
+    torch.backends.cudnn.deterministic = bool(args.deterministic)
+    torch.backends.cudnn.benchmark = not bool(args.deterministic)
+    root_train = Path("train_best")
     root_val = Path("val_png_best")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -327,8 +350,17 @@ def train(args):
         val_len = max(1, int(0.1 * len(full_ds)))
         train_ds, val_ds = random_split(full_ds, [len(full_ds)-val_len, val_len])
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
+    if args.deterministic:
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+        # generator = g固定了每个epoch的shuffle次序；seed_worker让（哪怕你以后把num_workers > 0）也能可复现
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=0, generator=g, worker_init_fn=seed_worker)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=0, generator=g, worker_init_fn=seed_worker)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = AttentionASPPUNet(base_c=args.base_c).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
@@ -355,7 +387,8 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    best = 0.0; best_path = out_dir/"best.pt"
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    best = 0.0; best_path = out_dir/f"best_{ts}.pt"
     no_improve = 0
 
     for ep in range(1, total_epochs + 1):
@@ -490,7 +523,9 @@ def calibrate(args):
 
 @torch.inference_mode()
 def predict(args):
-    set_seed()
+    set_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # 读取全局阈值
     thr_cfg = Path("./checkpoints/thr.json")
@@ -596,6 +631,10 @@ def get_args():
     sp = p.add_subparsers(dest="cmd", required=True)
 
     t = sp.add_parser("train")
+    t.add_argument("--seed", type=int, default=SEED)
+    t.add_argument("--deterministic", action="store_true",
+                   help="开启完全可复现模式（固定 DataLoader/Albumentations/cuDNN）")
+
     t.add_argument("--data_dir", required=True)
     t.add_argument("--output_dir", default="./checkpoints")
     t.add_argument("--epochs", type=int, default=120)
@@ -605,12 +644,14 @@ def get_args():
     t.add_argument("--edge_w", type=float, default=0.05, help="边界损失权重，0~0.1之间可调")
 
     pr = sp.add_parser("predict")
+    pr.add_argument("--seed", type=int, default=SEED)
     pr.add_argument("--weights", required=True)
     pr.add_argument("--input_dir", required=True)
     pr.add_argument("--out_dir", default="./preds")
     pr.add_argument("--base_c", type=int, default=48)
 
     ca = sp.add_parser("calibrate")
+    ca.add_argument("--seed", type=int, default=SEED)
     ca.add_argument("--weights", required=True)
     ca.add_argument("--val_dir", required=True)    # e.g. ./val_png_best
     ca.add_argument("--output_dir", default="./checkpoints")
