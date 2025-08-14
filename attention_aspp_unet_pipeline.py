@@ -601,6 +601,7 @@ def predict(args):
             frame_idx = int(img_path.stem.split('_s')[1])  # 例如 Case001_s027
             rows.append((case_id, frame_idx, round(ac_mm, 1)))
 
+
             print(f"[✓] {img_path.stem}: AC={ac_mm:.1f} mm")
             csv_path = out_dir / "ac_results.csv"
             with open(csv_path, "w", newline="") as f:
