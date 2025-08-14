@@ -23,12 +23,32 @@ from albumentations import (
 
 from albumentations.pytorch import ToTensorV2
 from datetime import datetime
-import os, random
-import albumentations as A
+import random
 try:
     import SimpleITK as sitk
 except ImportError:
     sitk = None
+import math
+def _ellipse_circum(a, b):
+    h = ((a - b) ** 2) / ((a + b) ** 2)
+    return math.pi * (a + b) * (1 + 3*h / (10 + math.sqrt(4 - 3*h)))
+
+def measure_ac_mm(mask01, spacing):
+    """
+    mask01: 0/1 numpy, spacing=(sx,sy) mm/px
+    return: AC (mm)
+    """
+    import cv2, numpy as np
+    cnts, _ = cv2.findContours(mask01.astype(np.uint8),
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return 0.0
+    c = max(cnts, key=cv2.contourArea)
+    if len(c) >= 5:
+        (_, _), (MA, ma), _ = cv2.fitEllipse(c)
+        a_mm, b_mm = MA/2*spacing[0], ma/2*spacing[1]
+        return _ellipse_circum(a_mm, b_mm)
+    return cv2.arcLength(c, True) * float(sum(spacing)/2)
 
 # ---------------- Common Config ----------------
 SEED = 2025
@@ -527,6 +547,13 @@ def predict(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # ---------- 读取 spacing JSON ----------  ### NEW
+    spacing_json = Path(args.spacing_json)
+    if not spacing_json.exists():
+        raise FileNotFoundError(f"spacing JSON not found: {spacing_json}")
+    spacing_map = json.load(open(spacing_json))
+    print(f"[i] loaded spacing map ({len(spacing_map)})")
+
     # 读取全局阈值
     thr_cfg = Path("./checkpoints/thr.json")
     GLOBAL_THR = 0.48
@@ -549,26 +576,30 @@ def predict(args):
     for img_path in sorted(input_dir.iterdir()):
         ext = img_path.suffix.lower()
         if ext in {'.png', '.jpg', '.jpeg'}:
-            # 读2D
+            # —— 读图 + 推理（原代码） ——
             sl = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
             sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
             enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
-
-            # Resize到训练分辨率
             sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)
 
-            prob = predict_prob_tta(model, x)                    # (H',W')
-            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))  # 还原
-            prob = cv2.GaussianBlur(prob, (5,5), 0)              # 阈值前平滑
+            prob = predict_prob_tta(model, x)
+            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
+            prob = cv2.GaussianBlur(prob, (5, 5), 0)
+            mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
 
-            thr = GLOBAL_THR
-            m = (prob > thr).astype(np.uint8)
-            mask = refine_mask(m)
+            # ---------- ② 计算 AC ----------
+            case_id = img_path.stem.split('_s')[0]
+            sx, sy = spacing_map[case_id]["spacing"]
+            ac_mm = measure_ac_mm(mask, (sx, sy))
 
+            # ---------- ③ 保存 ----------
             cv2.imwrite(str(out_dir / f"{img_path.stem}_mask.png"), mask * 255)
-            print(f"[✓] Saved: {img_path.stem}_mask.png")
+            with open(out_dir / f"{img_path.stem}_ac.json", "w") as f:
+                json.dump({"ac_mm": round(ac_mm, 1)}, f, indent=2)
+
+            print(f"[✓] {img_path.stem}: AC={ac_mm:.1f} mm  (mask+json saved)")
 
         elif ext == '.mha':
             if sitk is None:
@@ -644,11 +675,14 @@ def get_args():
     t.add_argument("--edge_w", type=float, default=0.05, help="边界损失权重，0~0.1之间可调")
 
     pr = sp.add_parser("predict")
+    pr = sp.add_parser("predict")
     pr.add_argument("--seed", type=int, default=SEED)
     pr.add_argument("--weights", required=True)
     pr.add_argument("--input_dir", required=True)
     pr.add_argument("--out_dir", default="./preds")
     pr.add_argument("--base_c", type=int, default=48)
+    pr.add_argument("--spacing_json", default="train_png_best/masks/best_frame_indices.json",
+                    help="convert_best_frame_only.py 生成的 JSON")  ### NEW
 
     ca = sp.add_parser("calibrate")
     ca.add_argument("--seed", type=int, default=SEED)
