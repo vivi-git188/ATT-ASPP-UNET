@@ -1,70 +1,61 @@
 #!/usr/bin/env python3
 """
-Analyze fetal abdominal circumference (AC) predictions vs ground‑truth.
+Analyze fetal abdominal circumference (AC) predictions vs ground‑truth — *sweep‑aware* version.
 
-Configuration
--------------
-You can either:
-  1. Simply **edit the paths in the CONFIG block below** and run
-         $ python analyze_ac_results.py
-     with *no* command‑line arguments; or
-  2. Override any of them from the command line, e.g.
-         $ python analyze_ac_results.py --baseline other.csv
+Key change
+==========
+• Predictions contain **frame_idx**.  We infer
+      sweep_idx = frame_idx // FRAMES_PER_SWEEP  (0‑based)
+  and require GT AC from the **same sweep** (sweep_1_ac_mm → sweep_idx 0 …).
 
-Inputs
-~~~~~~
-  • Ground‑truth  (wide format) : fetal_abdominal_circumferences_per_sweep.csv
-  • Baseline predictions        : ac_measurements.csv
-  • New‑model predictions       : ac_results.csv
-
-Each *prediction* CSV must have columns:
-    case_id, frame_idx (optional), ac_mm
-The GT CSV must have columns:
-    uuid (or case_id), … , sweep_#_ac_mm
-
-Outputs (to out_dir)
-~~~~~~~~~~~~~~~~~~~~
-  metrics.csv      – summary table (MAE, RMSE, …)
-  stats.txt        – paired t‑test & Wilcoxon result
-  *.png            – scatter, Bland–Altman, error histogram plots
+Outputs (in OUT directory)
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+  merged_ac_values.csv  – case_id · sweep_idx · frame_idx · ac_mm · gt_ac_mm · model
+  metrics.csv           – MAE / RMSE / MAPE / r (per model)
+  stats.txt             – paired t‑test & Wilcoxon result
+  *.png                 – scatter / Bland‑Altman / error histogram
 """
 
 import argparse
 from pathlib import Path
+from typing import Callable, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 import matplotlib.pyplot as plt
 
-# ---------------------------------------------------------------------------
-# 📝 USER CONFIG – edit the four paths below as you like
-# ---------------------------------------------------------------------------
+# ==========================================================================
+# 📝 USER CONFIG – edit paths & sweep length if needed
+# ==========================================================================
 CONFIG = {
     "GT": "ac_result/gt/fetal_abdominal_circumferences_per_sweep.csv",
     "BASELINE": "ac_result/baseline/ac_measurements.csv",
     "NEW": "ac_result/aspp/ac_results.csv",
     "OUT": "ac_result/ac_analysis_results",
+    "FRAMES_PER_SWEEP": 140,   # 🟡 adjust if sweep length differs
 }
-# ---------------------------------------------------------------------------
+# ==========================================================================
 
+# -------------------------------------------------------------------------
+# CLI → fall back to CONFIG
+# -------------------------------------------------------------------------
 
 def parse_args():
-    """Parse CLI args but fall back to CONFIG defaults when omitted."""
-    p = argparse.ArgumentParser(description="Analyze AC predictions vs GT")
+    p = argparse.ArgumentParser(description="Analyze AC predictions vs GT (sweep‑aware)")
     p.add_argument("--gt", default=CONFIG["GT"], help="Ground‑truth AC CSV (wide)")
     p.add_argument("--baseline", default=CONFIG["BASELINE"], help="Baseline prediction CSV")
     p.add_argument("--new", default=CONFIG["NEW"], help="New‑model prediction CSV")
     p.add_argument("--out", default=CONFIG["OUT"], help="Output directory")
+    p.add_argument("--fps", type=int, default=CONFIG["FRAMES_PER_SWEEP"], help="Frames per sweep")
     return p.parse_args()
 
-
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------------
 
 def melt_gt(gt_df: pd.DataFrame) -> pd.DataFrame:
-    """Convert wide GT table to long format with columns [case_id, gt_ac_mm]."""
+    """Wide GT ➔ long [case_id, sweep_idx, gt_ac_mm]."""
     sweep_cols = [c for c in gt_df.columns if c.endswith("_ac_mm")]
     long = (
         gt_df.melt(id_vars=[c for c in gt_df.columns if c not in sweep_cols],
@@ -73,19 +64,20 @@ def melt_gt(gt_df: pd.DataFrame) -> pd.DataFrame:
                     value_name="gt_ac_mm")
             .dropna(subset=["gt_ac_mm"]).copy()
     )
-    # harmonise key name
     if "uuid" in long.columns and "case_id" not in long.columns:
         long["case_id"] = long["uuid"]
-    return long[["case_id", "gt_ac_mm"]]
+    long["sweep_idx"] = long["sweep"].str.extract(r"(\\d+)").astype(int) - 1  # sweep_1 ➔ 0
+    return long[["case_id", "sweep_idx", "gt_ac_mm"]]
 
 
-def read_pred(path: str, model_name: str) -> pd.DataFrame:
+def read_pred(path: str, model_name: str, fps: int) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["model"] = model_name
-    required = {"case_id", "ac_mm"}
+    required = {"case_id", "frame_idx", "ac_mm"}
     if not required.issubset(df.columns):
         raise ValueError(f"{path} must contain columns: {required}")
-    return df[["case_id", "ac_mm", "model"]]
+    df["sweep_idx"] = (df["frame_idx"] // fps).astype(int)
+    return df[["case_id", "sweep_idx", "frame_idx", "ac_mm", "model"]]
 
 
 def add_error(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,15 +86,14 @@ def add_error(df: pd.DataFrame) -> pd.DataFrame:
     df["ape_%"] = df["abs_err"] / df["gt_ac_mm"] * 100
     return df
 
-
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Plot helpers (unchanged)
+# -------------------------------------------------------------------------
 
 def scatter_plot(ax, gt, pred, title):
     ax.scatter(gt, pred, alpha=0.6)
-    min_, max_ = np.nanmin(gt), np.nanmax(gt)
-    ax.plot([min_, max_], [min_, max_], ls="--", lw=1)
+    lims = [min(gt.min(), pred.min()), max(gt.max(), pred.max())]
+    ax.plot(lims, lims, ls="--", lw=1)
     ax.set_xlabel("GT AC (mm)")
     ax.set_ylabel("Predicted AC (mm)")
     ax.set_title(title)
@@ -111,104 +102,80 @@ def scatter_plot(ax, gt, pred, title):
 def bland_altman(ax, gt, pred, title):
     diff = pred - gt
     mean = (gt + pred) / 2
-    md = np.mean(diff)
-    sd = np.std(diff, ddof=1)
-    loA, upA = md - 1.96 * sd, md + 1.96 * sd
-
+    md, sd = diff.mean(), diff.std(ddof=1)
+    loa = 1.96 * sd
     ax.scatter(mean, diff, alpha=0.6)
     ax.axhline(md, ls="--")
-    ax.axhline(loA, ls="--", color="r")
-    ax.axhline(upA, ls="--", color="r")
+    ax.axhline(md - loa, ls="--", color="r")
+    ax.axhline(md + loa, ls="--", color="r")
     ax.set_xlabel("Mean of GT & Pred (mm)")
     ax.set_ylabel("Difference (Pred – GT) (mm)")
-    ax.set_title(f"Bland–Altman: {title}\nmean={md:.2f} mm, ±1.96SD")
+    ax.set_title(f"Bland–Altman: {title}\nmean={md:.2f} ±1.96SD")
 
-
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Main workflow
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def main():
     args = parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Read data
-    gt_raw = pd.read_csv(args.gt)
-    gt_long = melt_gt(gt_raw)
+    # 1. Load data
+    gt_long = melt_gt(pd.read_csv(args.gt))
+    baseline = read_pred(args.baseline, "baseline", args.fps)
+    new      = read_pred(args.new, "attention_aspp_unet", args.fps)
 
-    baseline = read_pred(args.baseline, "baseline")
-    new = read_pred(args.new, "attention_aspp_unet")
-
-    # 2. Merge
     preds = pd.concat([baseline, new], ignore_index=True)
-    data = preds.merge(gt_long, on="case_id", how="inner")
+    data  = preds.merge(gt_long, on=["case_id", "sweep_idx"], how="inner")
     if data.empty:
-        raise RuntimeError("No matching case_id between predictions and GT.")
+        raise RuntimeError("No matching (case_id, sweep_idx) between predictions and GT.")
 
-    # 3. Error metrics
     data = add_error(data)
+    data.to_csv(out_dir / "merged_ac_values.csv", index=False)
 
-    metrics = (
-        data.groupby("model")
-            .agg(MAE_mm=("abs_err", "mean"),
-                 RMSE_mm=("sq_err", lambda x: np.sqrt(x.mean())),
-                 MAPE_pct=("ape_%", "mean"),
-                 Corr_r=("ac_mm", lambda x: x.corr(data.loc[x.index, "gt_ac_mm"])) )
-            .round(3)
-    )
+    # 2. Metrics
+    metrics = (data.groupby("model")
+                 .agg(MAE_mm=("abs_err", "mean"),
+                      RMSE_mm=("sq_err", lambda x: np.sqrt(x.mean())),
+                      MAPE_pct=("ape_%", "mean"),
+                      Corr_r=("ac_mm", lambda x: x.corr(data.loc[x.index, "gt_ac_mm"])))
+                 .round(3))
     metrics.to_csv(out_dir / "metrics.csv")
     print("\n*** Metrics ***\n", metrics, sep="\n")
 
-    # 4. Paired tests (abs error baseline vs new)
-    base_err = data.query("model == 'baseline'")["abs_err"].values
-    new_err = data.query("model == 'attention_aspp_unet'")["abs_err"].values
-
+    # 3. Paired tests
+    base_err = data.query("model=='baseline'")["abs_err"].values
+    new_err  = data.query("model=='attention_aspp_unet'")["abs_err"].values
     if len(base_err) != len(new_err):
-        raise RuntimeError("Baseline and new model have different number of cases; ensure 1 prediction per case.")
-
+        raise RuntimeError("Different number of matched sweeps between models.")
     t_stat, p_t = stats.ttest_rel(base_err, new_err)
     w_stat, p_w = stats.wilcoxon(base_err, new_err, zero_method="zsplit")
-
     with open(out_dir / "stats.txt", "w") as f:
-        f.write(f"Paired t-test:         t = {t_stat:.3f}, p = {p_t:.4g}\n")
-        f.write(f"Wilcoxon signed-rank: W = {w_stat:.1f}, p = {p_w:.4g}\n")
+        f.write(f"Paired t‑test:         t = {t_stat:.3f}, p = {p_t:.4g}\n")
+        f.write(f"Wilcoxon signed‑rank: W = {w_stat:.1f}, p = {p_w:.4g}\n")
+    print("Statistical tests written to stats.txt")
 
-    print("\nStatistical tests written to stats.txt")
+    # 4. Plots
+    for model in ["baseline", "attention_aspp_unet"]:
+        sub = data.query("model == @model")
+        # scatter
+        fig, ax = plt.subplots(figsize=(5,5))
+        scatter_plot(ax, sub["gt_ac_mm"], sub["ac_mm"], f"{model} (n={len(sub)})")
+        fig.tight_layout(); fig.savefig(out_dir / f"scatter_{model}.png", dpi=300); plt.close(fig)
+        # BA
+        fig, ax = plt.subplots(figsize=(5,5))
+        bland_altman(ax, sub["gt_ac_mm"], sub["ac_mm"], model)
+        fig.tight_layout(); fig.savefig(out_dir / f"bland_altman_{model}.png", dpi=300); plt.close(fig)
 
-    # 5. Plots
-    for model_name in ["baseline", "attention_aspp_unet"]:
-        subset = data.query("model == @model_name")
+    # error hist
+    fig, ax = plt.subplots(figsize=(6,4))
+    for model, a in zip(["baseline", "attention_aspp_unet"], [0.5,0.5]):
+        ax.hist(data.query("model == @model")["abs_err"], bins=25, alpha=a, label=model, histtype="stepfilled")
+    ax.set_xlabel("|Pred – GT| (mm)"); ax.set_ylabel("Freq"); ax.set_title("Error distribution"); ax.legend()
+    fig.tight_layout(); fig.savefig(out_dir / "error_hist.png", dpi=300); plt.close(fig)
 
-        # Scatter
-        fig, ax = plt.subplots(figsize=(5, 5))
-        scatter_plot(ax, subset["gt_ac_mm"].values, subset["ac_mm"].values,
-                     f"{model_name} (n={len(subset)})")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"scatter_{model_name}.png", dpi=300)
-        plt.close(fig)
-
-        # Bland–Altman
-        fig, ax = plt.subplots(figsize=(5, 5))
-        bland_altman(ax, subset["gt_ac_mm"].values, subset["ac_mm"].values, model_name)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"bland_altman_{model_name}.png", dpi=300)
-        plt.close(fig)
-
-    # Combined error histogram
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for model_name, alpha in zip(["baseline", "attention_aspp_unet"], [0.6, 0.6]):
-        errs = data.query("model == @model_name")["abs_err"].values
-        ax.hist(errs, bins=25, alpha=alpha, label=model_name, histtype="stepfilled")
-    ax.set_xlabel("Absolute error |Pred – GT| (mm)")
-    ax.set_ylabel("Frequency")
-    ax.set_title("Error distribution")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / "error_hist.png", dpi=300)
-    plt.close(fig)
-
-    print(f"\nAnalysis complete. All outputs in → {out_dir.resolve()}")
+    print(f"\nAnalysis complete. Outputs saved in → {out_dir.resolve()}")
 
 
 if __name__ == "__main__":
