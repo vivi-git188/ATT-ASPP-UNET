@@ -356,7 +356,7 @@ def train(args):
     torch.backends.cudnn.deterministic = bool(args.deterministic)
     torch.backends.cudnn.benchmark = not bool(args.deterministic)
     root_train = Path("train_best")
-    root_val = Path("val_png_best")
+    root_val = Path("val_png_best_ac")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_imgs, train_msks = collect_pairs(root_train/"images", root_train/"masks")
@@ -553,6 +553,7 @@ def predict(args):
         raise FileNotFoundError(f"spacing JSON not found: {spacing_json}")
     spacing_map = json.load(open(spacing_json))
     print(f"[i] loaded spacing map ({len(spacing_map)})")
+    rows = []
 
     # 读取全局阈值
     thr_cfg = Path("./checkpoints/thr.json")
@@ -596,10 +597,19 @@ def predict(args):
 
             # ---------- ③ 保存 ----------
             cv2.imwrite(str(out_dir / f"{img_path.stem}_mask.png"), mask * 255)
-            with open(out_dir / f"{img_path.stem}_ac.json", "w") as f:
-                json.dump({"ac_mm": round(ac_mm, 1)}, f, indent=2)
 
-            print(f"[✓] {img_path.stem}: AC={ac_mm:.1f} mm  (mask+json saved)")
+            frame_idx = int(img_path.stem.split('_s')[1])  # 例如 Case001_s027
+            rows.append((case_id, frame_idx, round(ac_mm, 1)))
+
+            print(f"[✓] {img_path.stem}: AC={ac_mm:.1f} mm")
+            csv_path = out_dir / "ac_results.csv"
+            with open(csv_path, "w", newline="") as f:
+                import csv
+                w = csv.writer(f)
+                w.writerow(["case_id", "frame_idx", "ac_mm"])
+                w.writerows(rows)
+
+            print(f"\n[✓] AC 结果已保存 → {csv_path}  (共 {len(rows)} 条)")
 
         elif ext == '.mha':
             if sitk is None:
@@ -681,7 +691,7 @@ def get_args():
     pr.add_argument("--input_dir", required=True)
     pr.add_argument("--out_dir", default="./preds")
     pr.add_argument("--base_c", type=int, default=48)
-    pr.add_argument("--spacing_json", default="train_png_best/masks/best_frame_indices.json",
+    pr.add_argument("--spacing_json", default="val_png_best_ac/masks/best_frame_indices.json",
                     help="convert_best_frame_only.py 生成的 JSON")  ### NEW
 
     ca = sp.add_parser("calibrate")
