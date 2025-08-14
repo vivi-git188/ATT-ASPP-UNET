@@ -686,7 +686,6 @@ def get_args():
     t.add_argument("--edge_w", type=float, default=0.05, help="边界损失权重，0~0.1之间可调")
 
     pr = sp.add_parser("predict")
-    pr = sp.add_parser("predict")
     pr.add_argument("--seed", type=int, default=SEED)
     pr.add_argument("--weights", required=True)
     pr.add_argument("--input_dir", required=True)
