@@ -25,7 +25,7 @@ import seaborn as sns
 from PIL import Image
 
 # --------- 路径（与评估脚本保持一致）---------
-GT_DIR   = Path("val_png_best/masks")
+GT_DIR   = Path("val_png_best_ac/masks")
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")
 NEW_DIR  = Path("preds_aspp48")
 CSV_PATH = NEW_DIR / "seg_eval.csv"

@@ -32,7 +32,7 @@ except ModuleNotFoundError:
     HAS_PLT = False
 
 # ========= 使用者只需改下面 3 个目录（若结构不同） =========
-GT_DIR   = Path("val_png_best/masks")
+GT_DIR   = Path("val/masks")
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")
 NEW_DIR  = Path("preds_aspp48")
 # 若新模型文件有固定后缀，可写在这里：
