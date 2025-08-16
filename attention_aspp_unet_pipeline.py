@@ -58,8 +58,9 @@ GRAD_CLIP = 1.0
 EARLY_STOP_PATIENCE = 15
 
 # 损失：'combo'使用 Dice+BCE；'tversky'使用Tversky
-LOSS_TYPE = 'combo'   # 'combo' | 'tversky'
-TV_ALPHA, TV_BETA = 0.7, 0.3
+LOSS_TYPE = 'tversky'   # 'combo' | 'tversky'
+# TV_ALPHA, TV_BETA = 0.7, 0.3 #combo
+TV_ALPHA, TV_BETA = 0.8, 0.2 #tversky α 高→假阳性罚得更狠
 
 # ---- 兼容各版本 Albumentations 的随机种子设置 ----
 def set_seed(seed=SEED):
@@ -167,6 +168,11 @@ class AttentionASPPUNet(nn.Module):
         self.u2 = UpBlock(base_c*4, base_c*2)
         self.u1 = UpBlock(base_c*2, base_c, use_att=False)
         self.out_conv = nn.Conv2d(base_c, num_classes, 1)
+        # ↓ 新增一个 presence 头
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(base_c, 1)
+        )
     def forward(self, x):
         x1 = self.d1(x)
         x2 = self.d2(self.p1(x1))
@@ -177,7 +183,10 @@ class AttentionASPPUNet(nn.Module):
         d3 = self.u3(d4, x3)
         d2 = self.u2(d3, x2)
         d1 = self.u1(d2, x1)
-        return self.out_conv(d1)
+
+        seg_logit = self.out_conv(d1)  # (B,1,H,W)
+        cls_logit = self.cls_head(d1)  # (B,1)
+        return seg_logit, cls_logit
 
 # ---------------- Dataset ----------------
 class FetalACDataset(Dataset):
@@ -237,7 +246,7 @@ class FetalACDataset(Dataset):
         if self.msk_paths: msk = self._read(self.msk_paths[idx])
         sample = self.transform(image=img, mask=msk)
         # 归一化到[0,1]后转 tensor
-        return sample["image"].float(), (sample["mask"].unsqueeze(0).float() / 255.0)
+        return sample["image"].float(),(sample["mask"].unsqueeze(0).float() / 255.0),torch.tensor([float(sample["mask"].sum() > 0)], dtype=torch.float32)
 
 # ---------------- Utils ----------------
 def collect_pairs(img_dir: Path, msk_dir: Path | None):
@@ -414,12 +423,15 @@ def train(args):
     for ep in range(1, total_epochs + 1):
         model.train(); running = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {ep}/{total_epochs}")
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
+        for x, y, y_cls in pbar:
+            x, y, y_cls = x.to(device), y.to(device), y_cls.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                logit_map = model(x)
-                loss = criterion_fn(logit_map, y)
+                seg_logit, cls_logit = model(x)
+                seg_loss = criterion_fn(seg_logit, y)
+                cls_loss = bce_cls(cls_logit.squeeze(1), y_cls.squeeze(1))
+                loss = seg_loss + 0.2 * cls_loss  # λ=0.2 可自行调
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -444,15 +456,29 @@ def train(args):
 # ---------------- Predict ----------------
 from skimage.measure import label
 from scipy.ndimage import binary_fill_holes
-
 def predict_prob_tta(model, x):
-    """TTA：原图+水平翻转"""
-    logits = model(x)
+    """TTA：原图+水平翻转，仅返回分割概率 (H,W)"""
+    seg, _ = model(x)                           # ← 只取分割输出
     x_flip = torch.flip(x, dims=[-1])
-    logits_flip = model(x_flip)
-    logits_flip = torch.flip(logits_flip, dims=[-1])
-    logits = (logits + logits_flip) / 2.0
-    return torch.sigmoid(logits).cpu().numpy()[0, 0]
+    seg_f, _ = model(x_flip)
+    seg_f = torch.flip(seg_f, dims=[-1])
+    seg = (seg + seg_f) / 2.0
+    return torch.sigmoid(seg).cpu().numpy()[0, 0]
+
+CLS_THR = 0.40          # presence 阈值，可再校准
+def predict_prob_presence_tta(model, x):
+    """返回 seg_prob, presence_prob，做水平翻转 TTA"""
+    seg_logit, cls_logit = model(x)
+    x_flip = torch.flip(x, dims=[-1])
+    seg_flip, cls_flip = model(x_flip)
+    seg_flip = torch.flip(seg_flip, dims=[-1])
+    seg_logit  = (seg_logit  + seg_flip) / 2.0
+    cls_logit  = (cls_logit  + cls_flip) / 2.0
+    seg_prob   = torch.sigmoid(seg_logit).cpu().numpy()[0, 0]     # (H,W)
+    pres_prob  = torch.sigmoid(cls_logit).cpu().numpy()[0, 0]     # scalar
+    return seg_prob, pres_prob
+
+
 
 def otsu_on_prob(prob):
     """备用：对[0,1]概率图做 Otsu，自适应阈值并夹到[0.35,0.6]"""
@@ -524,13 +550,13 @@ def calibrate(args):
             x = sample["image"].unsqueeze(0).to(device)
             prob = predict_prob_tta(model, x)
             prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
-            prob = cv2.GaussianBlur(prob, (5,5), 0)   # 阈值前平滑
+            prob = cv2.GaussianBlur(prob, (5, 5), 0)  # 阈值前平滑
             m = (prob > float(thr)).astype(np.uint8)
 
-            gt = cv2.imread(str(val_msk_dir/p.name), cv2.IMREAD_GRAYSCALE)
-            gt = (gt>127).astype(np.uint8)
+            gt = cv2.imread(str(val_msk_dir / p.name), cv2.IMREAD_GRAYSCALE)
+            gt = (gt > 127).astype(np.uint8)
             inter = (m & gt).sum()
-            dice = (2*inter) / (m.sum() + gt.sum() + 1e-7)
+            dice = (2 * inter) / (m.sum() + gt.sum() + 1e-7)
             dices.append(dice)
         scores.append(np.mean(dices))
 
@@ -585,11 +611,14 @@ def predict(args):
             sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)
 
-            prob = predict_prob_tta(model, x)
-            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
-            prob = cv2.GaussianBlur(prob, (5, 5), 0)
-            mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
+            prob, presence = predict_prob_presence_tta(model, x)
 
+            if presence < CLS_THR:  # 没腹部 → 直接空掩码
+                mask = np.zeros_like(sl, dtype=np.uint8)
+            else:  # 有腹部 → 正常分割
+                prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
+                prob = cv2.GaussianBlur(prob, (5, 5), 0)
+                mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
             # ---------- ② 计算 AC ----------
             case_id = img_path.stem.split('_s')[0]
             sx, sy = spacing_map[case_id]["spacing"]
@@ -625,13 +654,15 @@ def predict(args):
                 sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
                 x = sample["image"].unsqueeze(0).to(device)
 
-                prob = predict_prob_tta(model, x)                        # (H',W')
-                prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))      # 还原
-                prob = cv2.GaussianBlur(prob, (5,5), 0)                  # 阈值前平滑
+                prob, presence = predict_prob_presence_tta(model, x)
 
-                thr = GLOBAL_THR
-                m = (prob > thr).astype(np.uint8)
-                mask = refine_mask(m)
+                if presence < CLS_THR:  # 没腹部 → 直接空掩码
+                    mask = np.zeros_like(sl, dtype=np.uint8)
+                else:  # 有腹部 → 正常分割
+                    prob = cv2.resize(prob, (sl.shape[1], sl.shape[0])) # 还原
+                    prob = cv2.GaussianBlur(prob, (5, 5), 0)  # 还原
+                    mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
+
                 pred_masks.append(mask)
 
             pred_stack = np.stack(pred_masks)                            # (N,H,W)
