@@ -97,7 +97,7 @@ def convert_best_frame_only(mha_root: str, out_root: str, split: str = "train"):
 
 # ------- CLI：任选 train / val / test ---------  ### NEW
 if __name__ == "__main__":
-    convert_best_frame_only('val', 'val_png_best_ac', 'val')
+    convert_best_frame_only('val_main', 'val_main_best', 'val')
     # stat_train = convert_best_frame_only('train', 'train_png_best')
     # stat_val = convert_best_frame_only('val', 'val_png_best')
 
