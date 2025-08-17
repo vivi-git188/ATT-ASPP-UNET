@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 try: import SimpleITK as sitk
 except ImportError: sitk = None
+import csv
 
 # ----- globals -----
 SEED, IMG_SIZE, WEIGHT_DECAY, GRAD_CLIP = 2025, 512, 5e-4, 1.0
@@ -290,7 +291,7 @@ def train(args):
 
     g=torch.Generator().manual_seed(args.seed)
     train_ld=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True,
-                        num_workers=0,generator=g,worker_init_fn=seed_worker)
+                        num_workers=0,generator=g,worker_init_fn=seed_worker,drop_last=True )
     val_ld  =DataLoader(val_ds,batch_size=args.batch_size,shuffle=False,
                         num_workers=0,generator=g,worker_init_fn=seed_worker)
 
@@ -303,7 +304,7 @@ def train(args):
     tot_ep=args.epochs; warm=0 if args.stage=="finetune" else max(1,int(0.05*tot_ep))
     cos=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=tot_ep-warm)
     sch=cos if warm==0 else torch.optim.lr_scheduler.SequentialLR(
-        opt,[torch.optim.lr_scheduler.LinearLR(opt,0.2,warm),cos],[warm])
+        opt,[torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.2, total_iters=warm),cos],[warm])
 
     base_loss=ComboLoss() if LOSS_TYPE=="combo" else TverskyLoss(TV_ALPHA,TV_BETA)
     edge_loss=EdgeLoss(); crit=build_criterion(args,base_loss,edge_loss)
@@ -352,6 +353,26 @@ def select_best(pred_stack,topk=5):
     circ=lambda m: (lambda c,A,P:(0 if P==0 else 4*np.pi*A/(P*P)))(*max(cv2.findContours(m,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0],key=cv2.contourArea))
     return int(max(idx,key=lambda i:circ(pred_stack[i])))
 
+import math
+def _ellipse_circum(a, b):
+    h = ((a - b) ** 2) / ((a + b) ** 2)
+    return math.pi * (a + b) * (1 + 3*h / (10 + math.sqrt(4 - 3*h)))
+def measure_ac_mm(mask01, spacing):
+    """
+    mask01: 0/1 numpy, spacing=(sx,sy) mm/px
+    return: AC (mm)
+    """
+    import cv2, numpy as np
+    cnts, _ = cv2.findContours(mask01.astype(np.uint8),
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return 0.0
+    c = max(cnts, key=cv2.contourArea)
+    if len(c) >= 5:
+        (_, _), (MA, ma), _ = cv2.fitEllipse(c)
+        a_mm, b_mm = MA/2*spacing[0], ma/2*spacing[1]
+        return _ellipse_circum(a_mm, b_mm)
+    return cv2.arcLength(c, True) * float(sum(spacing)/2)
 # ---------- calibrate ----------
 @torch.inference_mode()
 def calibrate(args):
@@ -378,31 +399,134 @@ def calibrate(args):
 # ---------- predict ----------
 @torch.inference_mode()
 def predict(args):
-    set_seed(); device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    thr_cfg=Path('./checkpoints/thr.json'); THR=0.48
-    if thr_cfg.exists(): THR=float(json.load(open(thr_cfg))['best_thr']); print(f"[i] use thr {THR:.3f}")
-    model=AttentionASPPUNet(base_c=args.base_c).to(device)
-    model.load_state_dict(torch.load(args.weights,map_location=device)); model.eval()
-    inp,od=Path(args.input_dir),Path(args.out_dir); od.mkdir(exist_ok=True,parents=True)
-    for p in sorted(inp.iterdir()):
-        if p.suffix.lower() in {'.png','.jpg','.jpeg'}:
-            sl=cv2.imread(str(p),0); sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
-            e=cv2.medianBlur(cv2.createCLAHE(1.0,(8,8)).apply(sl_u8),3)
-            x=Compose([Resize(IMG_SIZE,IMG_SIZE),ToFloat(max_value=255),ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
-            prob=predict_prob_tta(model,x); prob=cv2.resize(prob,sl.shape[::-1]); prob=cv2.GaussianBlur(prob,(5,5),0)
-            mask=refine_mask((prob>THR).astype(np.uint8)); cv2.imwrite(str(od/f"{p.stem}_mask.png"),mask*255)
-        elif p.suffix.lower()=='.mha':
-            if sitk is None: raise ImportError("SimpleITK needed for .mha")
-            vol=sitk.GetArrayFromImage(sitk.ReadImage(str(p))); preds=[]
-            for sl in vol:
-                sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
-                e=cv2.medianBlur(cv2.createCLAHE(1.0,(8,8)).apply(sl_u8),3)
-                x=Compose([Resize(IMG_SIZE,IMG_SIZE),ToFloat(max_value=255),ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
-                prob=predict_prob_tta(model,x); prob=cv2.resize(prob,sl.shape[::-1]); prob=cv2.GaussianBlur(prob,(5,5),0)
-                preds.append(refine_mask((prob>THR).astype(np.uint8)))
-            preds=np.stack(preds); bf=select_best(preds,5); bm=preds[bf]
-            # write ACOUSLIC-AI output (mha+json) — helper below
-            write_output_mha_and_json(bm,bf,p,od)
+    set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- 读取全局阈值 ----
+    thr_cfg = Path('./checkpoints/thr.json'); THR = 0.48
+    if thr_cfg.exists():
+        try:
+            THR = float(json.load(open(thr_cfg))['best_thr'])
+            print(f"[i] use thr {THR:.3f}")
+        except Exception:
+            pass
+
+    # ---- 读取 spacing_json（用于 PNG）----
+    spacing_map = {}
+    if args.spacing_json:
+        try:
+            spacing_map = json.load(open(args.spacing_json, "r"))
+            print(f"[i] loaded spacing map for PNG ({len(spacing_map)})")
+        except Exception as e:
+            print(f"[warn] cannot load spacing_json: {e}")
+
+    def _spacing_from_map(case_id: str) -> Tuple[float, float] | None:
+        """从 JSON 抽取 (sx, sy)。既兼容 {'spacing':[sx,sy]} 也兼容 [sx,sy]。"""
+        if case_id not in spacing_map:
+            return None
+        v = spacing_map[case_id]
+        if isinstance(v, dict) and "spacing" in v:
+            sx, sy = v["spacing"][:2]
+        elif isinstance(v, (list, tuple)) and len(v) >= 2:
+            sx, sy = v[:2]
+        else:
+            return None
+        return float(sx), float(sy)
+
+    # ---- 模型 ----
+    model = AttentionASPPUNet(base_c=args.base_c).to(device)
+    model.load_state_dict(torch.load(args.weights, map_location=device)); model.eval()
+
+    inp = Path(args.input_dir)
+    od  = Path(args.out_dir); od.mkdir(exist_ok=True, parents=True)
+
+    rows = []  # [(case_id, frame_idx, ac_mm)]
+
+    for p in tqdm(sorted(inp.iterdir()), desc="Processing files", unit="file"):
+        ext = p.suffix.lower()
+
+        # ---------------- PNG / JPG ----------------
+        if ext in {'.png', '.jpg', '.jpeg'}:
+            sl = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            e = cv2.medianBlur(cv2.createCLAHE(1.0, (8, 8)).apply(sl_u8), 3)
+            x = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255), ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
+
+            prob = predict_prob_tta(model, x)
+            prob = cv2.resize(prob, sl.shape[::-1])
+            prob = cv2.GaussianBlur(prob, (5, 5), 0)
+            mask = refine_mask((prob > THR).astype(np.uint8))
+
+            # 保存 mask 图
+            cv2.imwrite(str(od / f"{p.stem}_mask.png"), mask * 255)
+
+            # ---- 计算 AC（需要 spacing_json）----
+            # 取 case_id 与 frame_idx（例如 Case001_s027.png）
+            stem = p.stem
+            if "_s" in stem:
+                case_id = stem.split("_s")[0]
+                try:
+                    frame_idx = int(stem.split("_s")[1])
+                except Exception:
+                    frame_idx = -1
+            else:
+                case_id = stem
+                frame_idx = -1
+
+            spacing_xy = _spacing_from_map(case_id)
+            if spacing_xy is None:
+                # 如果没提供 spacing，就不计算该样本的 AC，但给出提示
+                print(f"[warn] no spacing for {case_id}, skip AC")
+            else:
+                ac_mm = round(measure_ac_mm(mask, spacing_xy), 1)
+                rows.append((case_id, frame_idx, ac_mm))
+                print(f"[✓] {stem}: AC={ac_mm:.1f} mm")
+
+        # ---------------- MHA ----------------
+        elif ext == '.mha':
+            if sitk is None:
+                raise ImportError("SimpleITK needed for .mha")
+
+            ref_img = sitk.ReadImage(str(p))
+            vol = sitk.GetArrayFromImage(ref_img)  # (N,H,W)
+            preds = []
+            for sl in tqdm(vol, desc=f"{p.name} slices", unit="slice",
+                           total=vol.shape[0], leave=False):
+                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                e = cv2.medianBlur(cv2.createCLAHE(1.0, (8, 8)).apply(sl_u8), 3)
+                x = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255), ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
+                prob = predict_prob_tta(model, x)
+                prob = cv2.resize(prob, sl.shape[::-1])
+                prob = cv2.GaussianBlur(prob, (5, 5), 0)
+                preds.append(refine_mask((prob > THR).astype(np.uint8)))
+
+            preds = np.stack(preds)                # (N,H,W)
+            bf = select_best(preds, 5)
+            bm = preds[bf]
+
+            # 写 challenge 需要的输出
+            write_output_mha_and_json(bm, bf, p, od)
+
+            # ---- 计算 AC（直接用 ITK spacing）----
+            # SimpleITK spacing: (sx, sy, sz) 单位 mm
+            sx, sy = float(ref_img.GetSpacing()[0]), float(ref_img.GetSpacing()[1])
+            ac_mm = round(measure_ac_mm(bm, (sx, sy)), 1)
+            case = p.stem
+            rows.append((case, int(bf), ac_mm))
+            print(f"[✓] {case}: best_frame={bf}, AC={ac_mm:.1f} mm")
+
+        else:
+            continue
+
+    # ---- 写出 CSV 汇总 ----
+    if rows:
+        csv_path = od / "ac_results.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["case_id", "frame_idx", "ac_mm"])
+            w.writerows(rows)
+        print(f"\n[✓] AC 结果已保存 → {csv_path}  (共 {len(rows)} 条)")
+
 
 def convert_mask_2d_to_3d(mask,frame,nf):
     m=(mask>0).astype(np.uint8)*2; vol=np.zeros((nf,*m.shape),np.uint8)
@@ -425,7 +549,7 @@ def get_args():
     t.add_argument("--epochs",type=int,default=120); t.add_argument("--batch_size",type=int,default=8); t.add_argument("--lr",type=float,default=3e-4)
     t.add_argument("--base_c",type=int,default=48); t.add_argument("--edge_w",type=float,default=0.05); t.add_argument("--neg_bce_w",type=float,default=0.05)
     pr=sp.add_parser("predict"); pr.add_argument("--weights",required=True); pr.add_argument("--input_dir",required=True)
-    pr.add_argument("--out_dir",default="./preds"); pr.add_argument("--base_c",type=int,default=48)
+    pr.add_argument("--out_dir",default="./preds");  pr.add_argument("--spacing_json",required=True);pr.add_argument("--base_c",type=int,default=48)
     ca=sp.add_parser("calibrate"); ca.add_argument("--weights",required=True); ca.add_argument("--val_dir",required=True)
     ca.add_argument("--output_dir",default="./checkpoints"); ca.add_argument("--base_c",type=int,default=48)
     return p.parse_args()

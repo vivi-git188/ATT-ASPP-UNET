@@ -32,11 +32,11 @@ except ModuleNotFoundError:
     HAS_PLT = False
 
 # ========= 使用者只需改下面 3 个目录（若结构不同） =========
-GT_DIR   = Path("val/masks")
+GT_DIR   = Path("val_png_best_ac/masks")
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")
-NEW_DIR  = Path("preds_aspp48")
+NEW_DIR  = Path("preds_finetune")
 # 若新模型文件有固定后缀，可写在这里：
-NEW_SUFFIX = "_mask"     # 例: abc_mask.png → 去掉 _mask 取 case-id
+NEW_SUFFIX = "_png"     # 例: abc_mask.png → 去掉 _mask 取 case-id
 # =========================================================
 
 OUT_CSV  = NEW_DIR / "seg_eval.csv"
@@ -121,6 +121,9 @@ def parse_args():
 
 def main():
     args=parse_args()
+    print(GT_DIR)
+    print(BASE_DIR)
+    print(NEW_DIR)
     if not (GT_DIR.exists() and BASE_DIR.exists() and NEW_DIR.exists()):
         raise SystemExit("❌ GT / BASE / NEW 目录不存在，先检查路径")
 
