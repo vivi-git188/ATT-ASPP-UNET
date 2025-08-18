@@ -381,7 +381,7 @@ def calibrate(args):
     model.load_state_dict(torch.load(args.weights,map_location=device)); model.eval()
     val_dir=Path(args.val_dir); imgs=sorted((val_dir/'images').glob('*.png'))
     thrs=np.linspace(0.35,0.6,11); scores=[]
-    for thr in thrs:
+    for thr in tqdm(thrs, desc="Scanning thresholds", unit="thr"):
         ds=[]
         for p in imgs:
             sl=cv2.imread(str(p),0); sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
