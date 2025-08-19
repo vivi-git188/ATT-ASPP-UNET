@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+import pandas as pd
+from scipy import stats
+
 import cv2, numpy as np, torch
 import torch.nn as nn; import torch.nn.functional as F
 from albumentations import (CLAHE, Compose, HorizontalFlip, MedianBlur,
@@ -324,6 +327,36 @@ def evaluate(model,loader,device):
         i += iou_score(logits, y)
 
     return d/len(loader), i/len(loader)
+def _save_topk_viz(imgs_u8, probs, masks, topk_idx, best_idx, ac_mm, out_png):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    K = len(topk_idx)
+    fig, axes = plt.subplots(2, K, figsize=(3.2*K, 6), dpi=180)
+    for j, idx in enumerate(topk_idx):
+        img = imgs_u8[idx]
+        prob = probs[idx]
+        m = masks[idx].astype(bool)
+        # 上排：概率热度
+        ax = axes[0, j]
+        ax.imshow(img, cmap="gray")
+        ax.imshow(prob, cmap="jet", alpha=0.35, vmin=0, vmax=1)
+        ax.set_title(f"s{idx}  circ={_circularity_score(masks[idx]):.2f}\narea={int(m.sum())}")
+        ax.axis("off")
+        # 下排：mask 叠加
+        ax = axes[1, j]
+        ax.imshow(img, cmap="gray")
+        ax.imshow(m, cmap="spring", alpha=0.35)
+        ax.axis("off")
+        # 高亮最佳
+        if idx == best_idx:
+            for a in (axes[0, j], axes[1, j]):
+                for sp in a.spines.values():
+                    sp.set_edgecolor("lime"); sp.set_linewidth(3)
+    fig.suptitle(f"Top-{K} candidates; best = s{best_idx}; AC = {ac_mm:.1f} mm", y=0.98)
+    plt.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
 
 # ---------- TRAIN ----------
 def train(args):
@@ -423,31 +456,124 @@ def train(args):
 # ---------- CALIBRATE ----------
 @torch.inference_mode()
 def calibrate(args):
+    import numpy as np, pandas as pd, matplotlib.pyplot as plt
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AttentionASPPUNet(
-        base_c=args.base_c,
-        use_att=not args.no_att,
-        use_aspp=not args.no_aspp,
-        att_depth=args.att_depth).to(device)
-
+    model=AttentionASPPUNet(base_c=args.base_c,use_att=not args.no_att,
+                            use_aspp=not args.no_aspp).to(device)
     model.load_state_dict(torch.load(args.weights,map_location=device)); model.eval()
 
-    val_dir=Path(args.val_dir); imgs=sorted((val_dir/'images').glob('*.png'))
-    thrs=np.linspace(0.35,0.6,11); scores=[]
+    val_dir=Path(args.val_dir)
+    imgs=sorted((val_dir/'images').glob('*.png'))
+    assert len(imgs)>0, f"No PNGs under {val_dir/'images'}"
+    thrs=np.linspace(0.35,0.60,11)
+
+    thr_means, thr_stds, thr_medians = [], [], []
+    all_rows=[]  # 可选：逐图逐阈值的原始分数
+
     for thr in tqdm(thrs,desc="Scanning"):
         ds=[]
         for p in imgs:
-            sl=cv2.imread(str(p),0); sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+            sl=cv2.imread(str(p),0)
+            sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
             e=cv2.medianBlur(cv2.createCLAHE(1.0,(8,8)).apply(sl_u8),3)
             x=Compose([Resize(IMG_SIZE,IMG_SIZE),ToFloat(max_value=255),ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
-            prob=predict_prob_tta(model,x); prob=cv2.resize(prob,sl.shape[::-1]); prob=cv2.GaussianBlur(prob,(5,5),0)
-            m=(prob>thr).astype(np.uint8); gt=(cv2.imread(str(val_dir/'masks'/p.name),0)>127).astype(np.uint8)
-            inter=(m&gt).sum(); ds.append(2*inter/(m.sum()+gt.sum()+1e-7))
-        scores.append(np.mean(ds))
-    best_thr=float(thrs[int(np.argmax(scores))])
-    Path(args.output_dir).mkdir(parents=True,exist_ok=True)
-    json.dump({'best_thr':best_thr},open(Path(args.output_dir)/'thr.json','w'),indent=2)
-    print(f"Calibrated thr={best_thr:.3f}")
+            prob=predict_prob_tta(model,x)
+            prob=cv2.resize(prob,sl.shape[::-1])
+            prob=cv2.GaussianBlur(prob,(5,5),0)
+            m=(prob>float(thr)).astype(np.uint8)
+            gt=(cv2.imread(str(val_dir/'masks'/p.name),0)>127).astype(np.uint8)
+            inter=(m&gt).sum()
+            dice=2*inter/(m.sum()+gt.sum()+1e-7)
+            ds.append(dice)
+            all_rows.append((p.name,float(thr),float(dice)))
+        ds=np.array(ds, dtype=np.float32)
+        thr_means.append(ds.mean()); thr_stds.append(ds.std()); thr_medians.append(np.median(ds))
+
+    thr_means=np.array(thr_means); thr_stds=np.array(thr_stds)
+
+
+    n = len(imgs)  # N=42
+    thr_sem = thr_stds / np.sqrt(n)
+    t_crit = stats.t.ppf(0.975, df=n - 1)  # 双尾95%: df=41
+    thr_ci95 = t_crit * thr_sem
+
+    # 线性敏感度：Dice ~ a + b*thr
+    b, a = np.polyfit(thrs, thr_means, 1)  # b<0（下降斜率）
+    delta_dice = thr_means[0] - thr_means[-1]  # 0.35 vs 0.60 的差
+    best_thr = float(thrs[int(np.argmax(thr_means))])
+
+    # 保存结果
+    out_root=Path(args.output_dir); out_root.mkdir(parents=True,exist_ok=True)
+    json.dump({'best_thr':best_thr}, open(out_root/'thr.json','w'), indent=2)
+
+    import pandas as pd
+    df_curve=pd.DataFrame({
+        'thr': thrs,
+        'dice_mean': thr_means,
+        'dice_std': thr_stds,
+        'dice_sem': thr_sem,
+        'dice_ci95': thr_ci95,
+        'dice_ci_lo': thr_means - thr_ci95,
+        'dice_ci_hi': thr_means + thr_ci95,
+        'dice_median': thr_medians
+    })
+    df_curve.to_csv(out_root/'calibrate_curve.csv', index=False)
+
+    # （可选）逐图明细
+    pd.DataFrame(all_rows, columns=['case','thr','dice']).to_csv(out_root/'calibrate_raw.csv', index=False)
+
+    plt.figure(figsize=(7, 4), dpi=200)
+    plt.plot(thrs, thr_means, marker='o', label='Mean Dice')
+    plt.fill_between(thrs, thr_means - thr_ci95, thr_means + thr_ci95,
+                     alpha=0.18, label='95% CI')
+
+    plt.axvline(best_thr, linestyle='--', label=f'best={best_thr:.3f}')
+    plt.xlabel('Threshold');
+    plt.ylabel('Dice');
+    plt.title('Threshold–Dice on Validation')
+
+    # 手动或自动 y 轴范围（二选一）
+    # plt.ylim(0.910, 0.935)     # 例如更聚焦
+    y_lo = (thr_means - thr_ci95).min() - 0.001
+    y_hi = (thr_means + thr_ci95).max() + 0.001
+    plt.ylim(max(0.0, y_lo), min(1.0, y_hi))
+
+    plt.legend(loc='best')
+    plt.figtext(0.99, 0.01,
+                f'N={n} cases; band=95% CI | slope={b:+.4f} Dice per 1.00 thr (≈{b / 0.01:+.4f} per +0.01); Δ={delta_dice:.4f}',
+                ha='right', va='bottom', fontsize=9, color='dimgray')
+
+    plt.tight_layout()
+    plt.savefig(out_root / 'thr_dice_curve.png');
+    plt.close()
+
+    plt.figure(figsize=(7, 4), dpi=200)
+    barw = (thrs[1] - thrs[0]) * 0.8
+    plt.bar(
+        thrs, thr_means, width=barw,
+        yerr=thr_ci95,
+        error_kw=dict(capsize=4, ecolor='gray', elinewidth=1),  # ← 误差条参数只写在这里
+        alpha=0.95, label='Mean ±95% CI'
+    )
+
+    plt.axvline(best_thr, linestyle='--', color='tab:blue', label=f'best={best_thr:.3f}')
+    plt.xlabel('Threshold');
+    plt.ylabel('Mean Dice');
+    plt.title('Threshold–Dice (bars)')
+
+    # 聚焦显示
+    # plt.ylim(0.910, 0.935)
+    y_lo = (thr_means - thr_ci95).min() - 0.001
+    y_hi = (thr_means + thr_ci95).max() + 0.001
+    plt.ylim(max(0.0, y_lo), min(1.0, y_hi))
+
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(out_root / 'thr_dice_bars.png');
+    plt.close()
+
+    print(f"Calibrated thr={best_thr:.3f} → saved to {out_root}")
+
 
 # ---------- PREDICT ----------
 @torch.inference_mode()
@@ -526,9 +652,20 @@ def predict(args):
             mask_att = refine_mask((prob_att > THR).astype(np.uint8))
 
             # ψ 热图：深两层取平均
+            # ---- ψ 热图 ----
             _, psi_list = model_att(x)
-            psi = torch.mean(torch.stack(psi_list), 0)[0, 0].cpu().numpy()
-            psi = cv2.resize(psi, sl.shape[::-1])
+            if psi_list:
+                psi_maps = [F.interpolate(p, size=x.shape[-2:], mode="bilinear", align_corners=False)
+                            for p in psi_list]
+                psi = torch.mean(torch.stack(psi_maps), 0)[0].cpu().numpy().squeeze()
+            else:
+                psi = np.zeros((IMG_SIZE, IMG_SIZE), np.float32)
+
+            # 把 512×512 ψ → 原图大小
+            psi = cv2.resize(psi, sl.shape[::-1], interpolation=cv2.INTER_LINEAR)
+
+            psi_c = colorize_prob(psi)  # ← 之后再上色
+            psi_over = overlay(sl_u8, psi_c)  # raw → sl_u8 或 raw_bgr 均可
 
             # (c) 推理：无 attention（若有）
             if model_na:
@@ -541,6 +678,9 @@ def predict(args):
                 mask_na = np.zeros_like(mask_att)
 
             # (d) 保存面板 ---------------------------------
+            if not args.viz_att or args.no_att:
+                psi = np.zeros_like(prob_att)  # 占位
+
             if args.viz_att:
                 save_panel(p.stem,                    # case_id
                            raw       = sl_u8,
@@ -566,9 +706,49 @@ def predict(args):
                 print(f"[warn] no spacing for {case}")
 
         # ---------- 3-D .mha （保持你原本逻辑） ----------
-        elif ext == ".mha":
-            ...
-            # 与旧代码相同，未做可视化
+        elif ext == '.mha':
+            if sitk is None: raise ImportError("SimpleITK needed")
+            ref = sitk.ReadImage(str(p))
+            vol = sitk.GetArrayFromImage(ref)
+
+            imgs_u8, probs, preds = [], [], []
+            for sl in tqdm(vol, leave=False, desc=p.name):
+                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                e = cv2.medianBlur(cv2.createCLAHE(1.0, (8, 8)).apply(sl_u8), 3)
+                x = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255), ToTensorV2()])(image=e)[
+                    'image'].unsqueeze(0).to(device)
+                prob = predict_prob_tta(model_att, x)  # (H,W), float in [0,1]
+                prob = cv2.resize(prob, sl.shape[::-1])  # 回到原尺寸
+                prob = cv2.GaussianBlur(prob, (5, 5), 0)
+                m = refine_mask((prob > THR).astype(np.uint8))
+
+                imgs_u8.append(sl_u8)
+                probs.append(prob)
+                preds.append(m)
+
+            preds_np = np.stack(preds)
+            # 先取面积 Top-K，再在其中按圆度选最佳
+            areas = np.array([m.sum() for m in preds_np])
+            K = min(5, len(areas))
+            topk_idx = areas.argsort()[::-1][:K]
+            best_idx = topk_idx[np.argmax([_circularity_score(preds_np[i]) for i in topk_idx])]
+
+            # 原有保存（3D 输出 + best 帧 JSON）
+            write_output_mha_and_json(preds[best_idx], int(best_idx), p, od)
+            ac = round(measure_ac_mm(preds[best_idx], ref.GetSpacing()[:2]), 1)
+            rows.append((p.stem, int(best_idx), ac))
+            print(f"[✓] {p.stem}: best={best_idx}, AC={ac:.1f} mm")
+
+            # 新增：保存 Top-K 可视化 + 每帧指标
+            out_png = od / f"{p.stem}_top{K}_viz.png"
+            _save_topk_viz(imgs_u8, probs, preds, topk_idx, int(best_idx), ac, str(out_png))
+            # 保存每帧的面积/圆度（可放论文补充）
+            circ = [float(_circularity_score(m)) for m in preds]
+            pd.DataFrame({
+                "slice": np.arange(len(preds)),
+                "area": [int(m.sum()) for m in preds],
+                "circularity": circ
+            }).to_csv(od / f"{p.stem}_slice_metrics.csv", index=False)
 
     # ⑦ 写 AC CSV ---------------------------------------------------------------
     if rows:
@@ -581,8 +761,15 @@ def predict(args):
 
 # ---------- VIZ UTILS ----------
 def colorize_prob(prob, cmap=cv2.COLORMAP_JET):
-    prob_u8 = (prob * 255).astype(np.uint8)
+    prob = np.squeeze(prob)               # ← 把 (1,H,W) / (H,W,1) 压成 (H,W)
+    prob = np.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+    prob = np.clip(prob, 0.0, 1.0)
+
+    prob_u8 = (prob * 255).round().astype(np.uint8)
+    prob_u8 = np.ascontiguousarray(prob_u8)
+
     return cv2.applyColorMap(prob_u8, cmap)
+
 
 def overlay(gray, color, alpha=0.5):
     gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -591,6 +778,9 @@ def overlay(gray, color, alpha=0.5):
 def save_panel(case_id, raw, prob_att, psi_att, mask_att,
                prob_na,  mask_na, out_dir):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    # NEW: 原灰度 → BGR，供面板拼接用
+    raw_bgr = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
     # ---- 带 attention ----
     pa = colorize_prob(prob_att);
     att_prob = overlay(raw, pa)
