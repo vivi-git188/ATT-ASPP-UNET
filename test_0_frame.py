@@ -22,14 +22,33 @@ from albumentations import (
 )
 
 from albumentations.pytorch import ToTensorV2
-
 from datetime import datetime
-import os, random
-import albumentations as A
+import random
 try:
     import SimpleITK as sitk
 except ImportError:
     sitk = None
+import math
+def _ellipse_circum(a, b):
+    h = ((a - b) ** 2) / ((a + b) ** 2)
+    return math.pi * (a + b) * (1 + 3*h / (10 + math.sqrt(4 - 3*h)))
+
+def measure_ac_mm(mask01, spacing):
+    """
+    mask01: 0/1 numpy, spacing=(sx,sy) mm/px
+    return: AC (mm)
+    """
+    import cv2, numpy as np
+    cnts, _ = cv2.findContours(mask01.astype(np.uint8),
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return 0.0
+    c = max(cnts, key=cv2.contourArea)
+    if len(c) >= 5:
+        (_, _), (MA, ma), _ = cv2.fitEllipse(c)
+        a_mm, b_mm = MA/2*spacing[0], ma/2*spacing[1]
+        return _ellipse_circum(a_mm, b_mm)
+    return cv2.arcLength(c, True) * float(sum(spacing)/2)
 
 # ---------------- Common Config ----------------
 SEED = 2025
@@ -39,12 +58,12 @@ GRAD_CLIP = 1.0
 EARLY_STOP_PATIENCE = 15
 
 # 损失：'combo'使用 Dice+BCE；'tversky'使用Tversky
-LOSS_TYPE = 'combo'   # 'combo' | 'tversky'
-TV_ALPHA, TV_BETA = 0.7, 0.3
+LOSS_TYPE = 'tversky'   # 'combo' | 'tversky'
+# TV_ALPHA, TV_BETA = 0.7, 0.3 #combo
+TV_ALPHA, TV_BETA = 0.8, 0.2 #tversky α 高→假阳性罚得更狠
 
 # ---- 兼容各版本 Albumentations 的随机种子设置 ----
 def set_seed(seed=SEED):
-    import random, os
     import os, random
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -149,6 +168,11 @@ class AttentionASPPUNet(nn.Module):
         self.u2 = UpBlock(base_c*4, base_c*2)
         self.u1 = UpBlock(base_c*2, base_c, use_att=False)
         self.out_conv = nn.Conv2d(base_c, num_classes, 1)
+        # ↓ 新增一个 presence 头
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(base_c, 1)
+        )
     def forward(self, x):
         x1 = self.d1(x)
         x2 = self.d2(self.p1(x1))
@@ -159,7 +183,10 @@ class AttentionASPPUNet(nn.Module):
         d3 = self.u3(d4, x3)
         d2 = self.u2(d3, x2)
         d1 = self.u1(d2, x1)
-        return self.out_conv(d1)
+
+        seg_logit = self.out_conv(d1)  # (B,1,H,W)
+        cls_logit = self.cls_head(d1)  # (B,1)
+        return seg_logit, cls_logit
 
 # ---------------- Dataset ----------------
 class FetalACDataset(Dataset):
@@ -219,7 +246,7 @@ class FetalACDataset(Dataset):
         if self.msk_paths: msk = self._read(self.msk_paths[idx])
         sample = self.transform(image=img, mask=msk)
         # 归一化到[0,1]后转 tensor
-        return sample["image"].float(), (sample["mask"].unsqueeze(0).float() / 255.0)
+        return sample["image"].float(),(sample["mask"].unsqueeze(0).float() / 255.0),torch.tensor([float(sample["mask"].sum() > 0)], dtype=torch.float32)
 
 # ---------------- Utils ----------------
 def collect_pairs(img_dir: Path, msk_dir: Path | None):
@@ -322,24 +349,38 @@ class SurfaceLoss(nn.Module):
 
 
 @torch.inference_mode()
+@torch.inference_mode()
 def evaluate(model, loader, device):
+    """评估 Dice / IoU —— 兼容 (x, y) 或 (x, y, y_cls) 批次格式"""
     model.eval()
-    dice, iou = 0., 0.
-    for x, y in loader:
+    dice_sum, iou_sum = 0.0, 0.0
+    val_bar = tqdm(loader, desc="Validating", leave=False)
+
+    for batch in val_bar:
+        # -------- 解包 --------
+        if len(batch) == 3:
+            x, y, _ = batch           # 忽略 presence 标签
+        else:
+            x, y = batch
+
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        dice += 1 - DiceLoss()(logits, y).item()
-        iou  += iou_score(logits, y)
-    return dice/len(loader), iou/len(loader)
+        seg_logit, _ = model(x)       # 只用分割头
+        dice_b = 1 - DiceLoss()(seg_logit, y).item()
+        iou_b  = iou_score(seg_logit, y)
+        dice_sum += dice_b; iou_sum += iou_b
+        val_bar.set_postfix(dice=f"{dice_b:.4f}", iou=f"{iou_b:.4f}")
+
+    n = len(loader)
+    return dice_sum / n, iou_sum / n
+
 
 def train(args):
-    set_seed()
     set_seed(args.seed)
     # cuDNN 确定性/基准选择
     torch.backends.cudnn.deterministic = bool(args.deterministic)
     torch.backends.cudnn.benchmark = not bool(args.deterministic)
     root_train = Path("train_png_best_0frame")
-    root_val = Path("val_png_best")
+    root_val = Path("val_png_best_ac")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_imgs, train_msks = collect_pairs(root_train/"images", root_train/"masks")
@@ -367,7 +408,7 @@ def train(args):
 
     model = AttentionASPPUNet(base_c=args.base_c).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
-
+    bce_cls = nn.BCEWithLogitsLoss()
     # Warmup + Cosine
     total_epochs = args.epochs
     warmup_epochs = max(1, int(0.05 * total_epochs))
@@ -390,7 +431,6 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    best = 0.0; best_path = out_dir/"best.pt"
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     best = 0.0; best_path = out_dir/f"best_{ts}.pt"
     no_improve = 0
@@ -398,12 +438,15 @@ def train(args):
     for ep in range(1, total_epochs + 1):
         model.train(); running = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {ep}/{total_epochs}")
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
+        for x, y, y_cls in pbar:
+            x, y, y_cls = x.to(device), y.to(device), y_cls.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                logit_map = model(x)
-                loss = criterion_fn(logit_map, y)
+                seg_logit, cls_logit = model(x)
+                seg_loss = criterion_fn(seg_logit, y)
+                cls_loss = bce_cls(cls_logit.squeeze(1), y_cls.squeeze(1))
+                loss = seg_loss + 0.2 * cls_loss  # λ=0.2 可自行调
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -428,15 +471,29 @@ def train(args):
 # ---------------- Predict ----------------
 from skimage.measure import label
 from scipy.ndimage import binary_fill_holes
-
 def predict_prob_tta(model, x):
-    """TTA：原图+水平翻转"""
-    logits = model(x)
+    """TTA：原图+水平翻转，仅返回分割概率 (H,W)"""
+    seg, _ = model(x)                           # ← 只取分割输出
     x_flip = torch.flip(x, dims=[-1])
-    logits_flip = model(x_flip)
-    logits_flip = torch.flip(logits_flip, dims=[-1])
-    logits = (logits + logits_flip) / 2.0
-    return torch.sigmoid(logits).cpu().numpy()[0, 0]
+    seg_f, _ = model(x_flip)
+    seg_f = torch.flip(seg_f, dims=[-1])
+    seg = (seg + seg_f) / 2.0
+    return torch.sigmoid(seg).cpu().numpy()[0, 0]
+
+CLS_THR = 0.40          # presence 阈值，可再校准
+def predict_prob_presence_tta(model, x):
+    """返回 seg_prob, presence_prob，做水平翻转 TTA"""
+    seg_logit, cls_logit = model(x)
+    x_flip = torch.flip(x, dims=[-1])
+    seg_flip, cls_flip = model(x_flip)
+    seg_flip = torch.flip(seg_flip, dims=[-1])
+    seg_logit  = (seg_logit  + seg_flip) / 2.0
+    cls_logit  = (cls_logit  + cls_flip) / 2.0
+    seg_prob   = torch.sigmoid(seg_logit).cpu().numpy()[0, 0]     # (H,W)
+    pres_prob  = torch.sigmoid(cls_logit).cpu().numpy()[0, 0]     # scalar
+    return seg_prob, pres_prob
+
+
 
 def otsu_on_prob(prob):
     """备用：对[0,1]概率图做 Otsu，自适应阈值并夹到[0.35,0.6]"""
@@ -508,13 +565,13 @@ def calibrate(args):
             x = sample["image"].unsqueeze(0).to(device)
             prob = predict_prob_tta(model, x)
             prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
-            prob = cv2.GaussianBlur(prob, (5,5), 0)   # 阈值前平滑
+            prob = cv2.GaussianBlur(prob, (5, 5), 0)  # 阈值前平滑
             m = (prob > float(thr)).astype(np.uint8)
 
-            gt = cv2.imread(str(val_msk_dir/p.name), cv2.IMREAD_GRAYSCALE)
-            gt = (gt>127).astype(np.uint8)
+            gt = cv2.imread(str(val_msk_dir / p.name), cv2.IMREAD_GRAYSCALE)
+            gt = (gt > 127).astype(np.uint8)
             inter = (m & gt).sum()
-            dice = (2*inter) / (m.sum() + gt.sum() + 1e-7)
+            dice = (2 * inter) / (m.sum() + gt.sum() + 1e-7)
             dices.append(dice)
         scores.append(np.mean(dices))
 
@@ -527,10 +584,17 @@ def calibrate(args):
 
 @torch.inference_mode()
 def predict(args):
-    set_seed()
     set_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # ---------- 读取 spacing JSON ----------  ### NEW
+    spacing_json = Path(args.spacing_json)
+    if not spacing_json.exists():
+        raise FileNotFoundError(f"spacing JSON not found: {spacing_json}")
+    spacing_map = json.load(open(spacing_json))
+    print(f"[i] loaded spacing map ({len(spacing_map)})")
+    rows = []
 
     # 读取全局阈值
     thr_cfg = Path("./checkpoints/thr.json")
@@ -554,26 +618,43 @@ def predict(args):
     for img_path in sorted(input_dir.iterdir()):
         ext = img_path.suffix.lower()
         if ext in {'.png', '.jpg', '.jpeg'}:
-            # 读2D
+            # —— 读图 + 推理（原代码） ——
             sl = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
             sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
             enhanced = cv2.medianBlur(clahe.apply(sl_u8), 3)
-
-            # Resize到训练分辨率
             sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
             x = sample["image"].unsqueeze(0).to(device)
 
-            prob = predict_prob_tta(model, x)                    # (H',W')
-            prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))  # 还原
-            prob = cv2.GaussianBlur(prob, (5,5), 0)              # 阈值前平滑
+            prob, presence = predict_prob_presence_tta(model, x)
 
-            thr = GLOBAL_THR
-            m = (prob > thr).astype(np.uint8)
-            mask = refine_mask(m)
+            if presence < CLS_THR:  # 没腹部 → 直接空掩码
+                mask = np.zeros_like(sl, dtype=np.uint8)
+            else:  # 有腹部 → 正常分割
+                prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))
+                prob = cv2.GaussianBlur(prob, (5, 5), 0)
+                mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
+            # ---------- ② 计算 AC ----------
+            case_id = img_path.stem.split('_s')[0]
+            sx, sy = spacing_map[case_id]["spacing"]
+            ac_mm = measure_ac_mm(mask, (sx, sy))
 
+            # ---------- ③ 保存 ----------
             cv2.imwrite(str(out_dir / f"{img_path.stem}_mask.png"), mask * 255)
-            print(f"[✓] Saved: {img_path.stem}_mask.png")
+
+            frame_idx = int(img_path.stem.split('_s')[1])  # 例如 Case001_s027
+            rows.append((case_id, frame_idx, round(ac_mm, 1)))
+
+
+            print(f"[✓] {img_path.stem}: AC={ac_mm:.1f} mm")
+            csv_path = out_dir / "ac_results.csv"
+            with open(csv_path, "w", newline="") as f:
+                import csv
+                w = csv.writer(f)
+                w.writerow(["case_id", "frame_idx", "ac_mm"])
+                w.writerows(rows)
+
+            print(f"\n[✓] AC 结果已保存 → {csv_path}  (共 {len(rows)} 条)")
 
         elif ext == '.mha':
             if sitk is None:
@@ -588,13 +669,15 @@ def predict(args):
                 sample = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255.0), ToTensorV2()])(image=enhanced)
                 x = sample["image"].unsqueeze(0).to(device)
 
-                prob = predict_prob_tta(model, x)                        # (H',W')
-                prob = cv2.resize(prob, (sl.shape[1], sl.shape[0]))      # 还原
-                prob = cv2.GaussianBlur(prob, (5,5), 0)                  # 阈值前平滑
+                prob, presence = predict_prob_presence_tta(model, x)
 
-                thr = GLOBAL_THR
-                m = (prob > thr).astype(np.uint8)
-                mask = refine_mask(m)
+                if presence < CLS_THR:  # 没腹部 → 直接空掩码
+                    mask = np.zeros_like(sl, dtype=np.uint8)
+                else:  # 有腹部 → 正常分割
+                    prob = cv2.resize(prob, (sl.shape[1], sl.shape[0])) # 还原
+                    prob = cv2.GaussianBlur(prob, (5, 5), 0)  # 还原
+                    mask = refine_mask((prob > GLOBAL_THR).astype(np.uint8))
+
                 pred_masks.append(mask)
 
             pred_stack = np.stack(pred_masks)                            # (N,H,W)
@@ -654,6 +737,8 @@ def get_args():
     pr.add_argument("--input_dir", required=True)
     pr.add_argument("--out_dir", default="./preds")
     pr.add_argument("--base_c", type=int, default=48)
+    pr.add_argument("--spacing_json", default="val_png_best_ac/masks/best_frame_indices.json",
+                    help="convert_best_frame_only.py 生成的 JSON")  ### NEW
 
     ca = sp.add_parser("calibrate")
     ca.add_argument("--seed", type=int, default=SEED)
@@ -674,4 +759,3 @@ if __name__ == "__main__":
         predict(args)
     elif args.cmd == "calibrate":
         calibrate(args)
-

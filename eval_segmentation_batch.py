@@ -34,7 +34,7 @@ except ModuleNotFoundError:
 # ========= 使用者只需改下面 3 个目录（若结构不同） =========
 GT_DIR   = Path("val_png_best_ac/masks")
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")
-NEW_DIR  = Path("preds_finetune")
+NEW_DIR  = Path("preds_panel")
 # 若新模型文件有固定后缀，可写在这里：
 NEW_SUFFIX = "_png"     # 例: abc_mask.png → 去掉 _mask 取 case-id
 # =========================================================

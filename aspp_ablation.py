@@ -294,6 +294,37 @@ def evaluate(model,loader,device):
         d+=1-DiceLoss()(l,y).item(); i+=iou_score(l,y)
     return d/len(loader), i/len(loader)
 
+def _save_topk_viz(imgs_u8, probs, masks, topk_idx, best_idx, ac_mm, out_png):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    K = len(topk_idx)
+    fig, axes = plt.subplots(2, K, figsize=(3.2*K, 6), dpi=180)
+    for j, idx in enumerate(topk_idx):
+        img = imgs_u8[idx]
+        prob = probs[idx]
+        m = masks[idx].astype(bool)
+        # 上排：概率热度
+        ax = axes[0, j]
+        ax.imshow(img, cmap="gray")
+        ax.imshow(prob, cmap="jet", alpha=0.35, vmin=0, vmax=1)
+        ax.set_title(f"s{idx}  circ={_circularity_score(masks[idx]):.2f}\narea={int(m.sum())}")
+        ax.axis("off")
+        # 下排：mask 叠加
+        ax = axes[1, j]
+        ax.imshow(img, cmap="gray")
+        ax.imshow(m, cmap="spring", alpha=0.35)
+        ax.axis("off")
+        # 高亮最佳
+        if idx == best_idx:
+            for a in (axes[0, j], axes[1, j]):
+                for sp in a.spines.values():
+                    sp.set_edgecolor("lime"); sp.set_linewidth(3)
+    fig.suptitle(f"Top-{K} candidates; best = s{best_idx}; AC = {ac_mm:.1f} mm", y=0.98)
+    plt.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
 # ---------- TRAIN ----------
 def train(args):
     set_seed(args.seed,args.deterministic)
@@ -342,64 +373,167 @@ def train(args):
     sch = cos if warm == 0 else torch.optim.lr_scheduler.SequentialLR(
         opt,
         [torch.optim.lr_scheduler.LinearLR(
-            opt,
-            start_factor=0.2,  # 训练伊始学习率 = 0.2 × lr
-            end_factor=1.0,  # 线性升至 1.0 × lr
-            total_iters=warm  # 共 warm 个 epoch
-        ),
-            cos],
+            opt, start_factor=0.2, end_factor=1.0, total_iters=warm),
+         cos],
         [warm])
-    base_loss=ComboLoss(); crit=build_criterion(base_loss,EdgeLoss(),
-                    0.0 if args.no_edge_loss else args.edge_w,args)
+
+    base_loss=ComboLoss()
+    crit=build_criterion(base_loss,EdgeLoss(),
+                         0.0 if args.no_edge_loss else args.edge_w, args)
     scaler=torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     out_dir=Path(args.output_dir)/('ckpt_main' if args.stage=='main' else 'ckpt_finetune')
     out_dir.mkdir(parents=True,exist_ok=True)
     best,noimp,best_p=0.,0,out_dir/f"best_{datetime.now():%Y%m%d-%H%M%S}.pt"
 
+    # --- 新增：准备 metrics.csv ---
+    metrics_csv = out_dir/'metrics.csv'
+    mfp = open(metrics_csv, 'w', newline='')
+    writer = csv.writer(mfp)
+    writer.writerow(["epoch","train_loss","val_loss","train_dice","val_dice","train_iou","val_iou"])
+    dice_metric = DiceLoss()
+
     for ep in range(1,args.epochs+1):
-        model.train(); run=0.
+        model.train()
+        train_loss_sum = 0.0
+        train_dice_sum = 0.0
+        train_iou_sum  = 0.0
+        n_batches = 0
+
         for x,y in tqdm(train_ld,f"Epoch {ep}/{args.epochs}"):
-            x,y=x.to(device),y.to(device); opt.zero_grad(set_to_none=True)
+            x,y=x.to(device),y.to(device)
+            opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 l=model(x); loss=crit(l,y)
-            scaler.scale(loss).backward(); scaler.unscale_(opt)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(),GRAD_CLIP)
-            scaler.step(opt); scaler.update(); run+=loss.item()
+            scaler.step(opt); scaler.update()
+
+            # 在线统计训练指标
+            train_loss_sum += loss.item()
+            with torch.no_grad():
+                train_dice_sum += (1 - dice_metric(l, y).item())
+                train_iou_sum  += iou_score(l, y)
+            n_batches += 1
+
         sch.step()
-        d,i=evaluate(model,val_ld,device)
-        print(f"[Val] Dice {d:.4f} | IoU {i:.4f}")
-        if d>best:
-            best=d; noimp=0; torch.save(model.state_dict(),best_p)
+
+        # 验证（含 val_loss）
+        model.eval()
+        val_loss_sum = 0.0
+        val_dice_sum = 0.0
+        val_iou_sum  = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for x,y in val_ld:
+                x,y=x.to(device),y.to(device)
+                l=model(x)
+                val_loss_sum += crit(l,y).item()
+                val_dice_sum += (1 - dice_metric(l, y).item())
+                val_iou_sum  += iou_score(l, y)
+                n_val += 1
+
+        train_loss = train_loss_sum / max(1,n_batches)
+        train_dice = train_dice_sum / max(1,n_batches)
+        train_iou  = train_iou_sum  / max(1,n_batches)
+        val_loss   = val_loss_sum   / max(1,n_val)
+        val_dice   = val_dice_sum   / max(1,n_val)
+        val_iou    = val_iou_sum    / max(1,n_val)
+
+        print(f"[Val] Dice {val_dice:.4f} | IoU {val_iou:.4f} | Loss {val_loss:.4f}")
+
+        # 写入 CSV
+        writer.writerow([ep, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                            f"{train_dice:.6f}", f"{val_dice:.6f}",
+                            f"{train_iou:.6f}", f"{val_iou:.6f}"])
+        mfp.flush()
+
+        # 早停/保存最好
+        if val_dice>best:
+            best=val_dice; noimp=0; torch.save(model.state_dict(),best_p)
             print(f"[✓] best saved → {best_p}")
         else:
             noimp+=1
-            if noimp>=EARLY_STOP_PATIENCE: print("Early stop"); break
+            if noimp>=EARLY_STOP_PATIENCE:
+                print("Early stop")
+                break
+
+    mfp.close()
+
 
 # ---------- CALIBRATE ----------
 @torch.inference_mode()
 def calibrate(args):
+    import numpy as np, pandas as pd, matplotlib.pyplot as plt
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model=AttentionASPPUNet(base_c=args.base_c,use_att=not args.no_att,
                             use_aspp=not args.no_aspp).to(device)
     model.load_state_dict(torch.load(args.weights,map_location=device)); model.eval()
 
-    val_dir=Path(args.val_dir); imgs=sorted((val_dir/'images').glob('*.png'))
-    thrs=np.linspace(0.35,0.6,11); scores=[]
+    val_dir=Path(args.val_dir)
+    imgs=sorted((val_dir/'images').glob('*.png'))
+    assert len(imgs)>0, f"No PNGs under {val_dir/'images'}"
+    thrs=np.linspace(0.35,0.60,11)
+
+    thr_means, thr_stds, thr_medians = [], [], []
+    all_rows=[]  # 可选：逐图逐阈值的原始分数
+
     for thr in tqdm(thrs,desc="Scanning"):
         ds=[]
         for p in imgs:
-            sl=cv2.imread(str(p),0); sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+            sl=cv2.imread(str(p),0)
+            sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
             e=cv2.medianBlur(cv2.createCLAHE(1.0,(8,8)).apply(sl_u8),3)
             x=Compose([Resize(IMG_SIZE,IMG_SIZE),ToFloat(max_value=255),ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
-            prob=predict_prob_tta(model,x); prob=cv2.resize(prob,sl.shape[::-1]); prob=cv2.GaussianBlur(prob,(5,5),0)
-            m=(prob>thr).astype(np.uint8); gt=(cv2.imread(str(val_dir/'masks'/p.name),0)>127).astype(np.uint8)
-            inter=(m&gt).sum(); ds.append(2*inter/(m.sum()+gt.sum()+1e-7))
-        scores.append(np.mean(ds))
-    best_thr=float(thrs[int(np.argmax(scores))])
-    Path(args.output_dir).mkdir(parents=True,exist_ok=True)
-    json.dump({'best_thr':best_thr},open(Path(args.output_dir)/'thr.json','w'),indent=2)
-    print(f"Calibrated thr={best_thr:.3f}")
+            prob=predict_prob_tta(model,x)
+            prob=cv2.resize(prob,sl.shape[::-1])
+            prob=cv2.GaussianBlur(prob,(5,5),0)
+            m=(prob>float(thr)).astype(np.uint8)
+            gt=(cv2.imread(str(val_dir/'masks'/p.name),0)>127).astype(np.uint8)
+            inter=(m&gt).sum()
+            dice=2*inter/(m.sum()+gt.sum()+1e-7)
+            ds.append(dice)
+            all_rows.append((p.name,float(thr),float(dice)))
+        ds=np.array(ds, dtype=np.float32)
+        thr_means.append(ds.mean()); thr_stds.append(ds.std()); thr_medians.append(np.median(ds))
+
+    thr_means=np.array(thr_means); thr_stds=np.array(thr_stds)
+    best_thr=float(thrs[int(np.argmax(thr_means))])
+
+    # 保存结果
+    out_root=Path(args.output_dir); out_root.mkdir(parents=True,exist_ok=True)
+    json.dump({'best_thr':best_thr}, open(out_root/'thr.json','w'), indent=2)
+
+    import pandas as pd
+    df_curve=pd.DataFrame({
+        'thr': thrs,
+        'dice_mean': thr_means,
+        'dice_std': thr_stds,
+        'dice_median': thr_medians
+    })
+    df_curve.to_csv(out_root/'calibrate_curve.csv', index=False)
+
+    # （可选）逐图明细
+    pd.DataFrame(all_rows, columns=['case','thr','dice']).to_csv(out_root/'calibrate_raw.csv', index=False)
+
+    # 画线图
+    plt.figure(figsize=(7,4), dpi=200)
+    plt.plot(thrs, thr_means, marker='o', label='Mean Dice')
+    plt.fill_between(thrs, thr_means-thr_stds, thr_means+thr_stds, alpha=0.15, label='±1σ')
+    plt.axvline(best_thr, linestyle='--', label=f'best={best_thr:.3f}')
+    plt.xlabel('Threshold'); plt.ylabel('Dice'); plt.title('Threshold–Dice on Validation')
+    plt.legend(); plt.tight_layout()
+    plt.savefig(out_root/'thr_dice_curve.png'); plt.close()
+
+    # 画柱状图
+    plt.figure(figsize=(7,4), dpi=200)
+    plt.bar(thrs, thr_means, width=(thrs[1]-thrs[0])*0.8)
+    plt.axvline(best_thr, linestyle='--')
+    plt.xlabel('Threshold'); plt.ylabel('Mean Dice'); plt.title('Threshold–Dice (bars)')
+    plt.tight_layout(); plt.savefig(out_root/'thr_dice_bars.png'); plt.close()
+
+    print(f"Calibrated thr={best_thr:.3f} → saved to {out_root}")
 
 # ---------- PREDICT ----------
 @torch.inference_mode()
@@ -442,20 +576,51 @@ def predict(args):
                 print(f"[warn] no spacing for {case}")
 
         # ---------- 3D ----------
-        elif ext=='.mha':
+        elif ext == '.mha':
             if sitk is None: raise ImportError("SimpleITK needed")
-            ref=sitk.ReadImage(str(p)); vol=sitk.GetArrayFromImage(ref)
-            preds=[]
-            for sl in tqdm(vol,leave=False,desc=p.name):
-                sl_u8=cv2.normalize(sl,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
-                e=cv2.medianBlur(cv2.createCLAHE(1.0,(8,8)).apply(sl_u8),3)
-                x=Compose([Resize(IMG_SIZE,IMG_SIZE),ToFloat(max_value=255),ToTensorV2()])(image=e)['image'].unsqueeze(0).to(device)
-                prob=predict_prob_tta(model,x); prob=cv2.resize(prob,sl.shape[::-1]); prob=cv2.GaussianBlur(prob,(5,5),0)
-                preds.append(refine_mask((prob>THR).astype(np.uint8)))
-            bf=select_best(np.stack(preds),5); bm=preds[bf]
-            write_output_mha_and_json(bm,bf,p,od)
-            ac=round(measure_ac_mm(bm,ref.GetSpacing()[:2]),1)
-            rows.append((p.stem,int(bf),ac)); print(f"[✓] {p.stem}: best={bf}, AC={ac:.1f} mm")
+            ref = sitk.ReadImage(str(p))
+            vol = sitk.GetArrayFromImage(ref)
+
+            imgs_u8, probs, preds = [], [], []
+            for sl in tqdm(vol, leave=False, desc=p.name):
+                sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                e = cv2.medianBlur(cv2.createCLAHE(1.0, (8, 8)).apply(sl_u8), 3)
+                x = Compose([Resize(IMG_SIZE, IMG_SIZE), ToFloat(max_value=255), ToTensorV2()])(image=e)[
+                    'image'].unsqueeze(0).to(device)
+                prob = predict_prob_tta(model, x)  # (H,W), float in [0,1]
+                prob = cv2.resize(prob, sl.shape[::-1])  # 回到原尺寸
+                prob = cv2.GaussianBlur(prob, (5, 5), 0)
+                m = refine_mask((prob > THR).astype(np.uint8))
+
+                imgs_u8.append(sl_u8)
+                probs.append(prob)
+                preds.append(m)
+
+            preds_np = np.stack(preds)
+            # 先取面积 Top-K，再在其中按圆度选最佳
+            areas = np.array([m.sum() for m in preds_np])
+            K = min(5, len(areas))
+            topk_idx = areas.argsort()[::-1][:K]
+            best_idx = topk_idx[np.argmax([_circularity_score(preds_np[i]) for i in topk_idx])]
+
+            # 原有保存（3D 输出 + best 帧 JSON）
+            write_output_mha_and_json(preds[best_idx], int(best_idx), p, od)
+            ac = round(measure_ac_mm(preds[best_idx], ref.GetSpacing()[:2]), 1)
+            rows.append((p.stem, int(best_idx), ac))
+            print(f"[✓] {p.stem}: best={best_idx}, AC={ac:.1f} mm")
+
+            # 新增：保存 Top-K 可视化 + 每帧指标
+            out_png = od / f"{p.stem}_top{K}_viz.png"
+            _save_topk_viz(imgs_u8, probs, preds, topk_idx, int(best_idx), ac, str(out_png))
+            # 保存每帧的面积/圆度（可放论文补充）
+            import pandas as pd
+            import numpy as np
+            circ = [float(_circularity_score(m)) for m in preds]
+            pd.DataFrame({
+                "slice": np.arange(len(preds)),
+                "area": [int(m.sum()) for m in preds],
+                "circularity": circ
+            }).to_csv(od / f"{p.stem}_slice_metrics.csv", index=False)
 
     if rows:
         with open(od/'ac_results.csv','w',newline='') as f:
