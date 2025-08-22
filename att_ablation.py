@@ -595,10 +595,31 @@ def predict(args):
     spacing_map = (json.load(open(args.spacing_json))
                    if args.spacing_json else {})
 
-    def _sp(case):
-        v = spacing_map.get(case)
-        return None if v is None else tuple(map(float,
-                    (v["spacing"] if isinstance(v, dict) else v)[:2]))
+    def _sp(case_id: str) -> Optional[Tuple[float, float]]:
+        """
+        兼容三种写法:
+          1) {"case": [sx, sy]}
+          2) {"case": {"spacing": [sx, sy], ...}}
+          3) {"case": {"_meta": {"spacing_xy_mm": [sx, sy]}, ...}}
+        """
+        v = spacing_map.get(case_id)
+        if v is None:
+            return None
+
+        # ① 直接 list / tuple
+        if isinstance(v, (list, tuple)):
+            return tuple(map(float, v[:2]))
+
+        # ② dict ── 老格式
+        if "spacing" in v:
+            return tuple(map(float, v["spacing"][:2]))
+
+        # ③ dict ── 新 convert_to_png 格式
+        if "_meta" in v and "spacing_xy_mm" in v["_meta"]:
+            return tuple(map(float, v["_meta"]["spacing_xy_mm"][:2]))
+
+        # ④ 其他未知结构
+        return None
 
     # ③ 加载带-attention 模型 ------------------------------------------------------
     model_att = AttentionASPPUNet(
