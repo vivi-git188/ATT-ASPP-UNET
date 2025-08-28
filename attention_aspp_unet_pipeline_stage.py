@@ -260,7 +260,7 @@ def train(args):
         train_imgs+=neg_imgs; train_msks+=[None]*len(neg_imgs)
     pos_cnt = sum(m is not None for m in train_msks)
     neg_cnt = len(train_msks) - pos_cnt
-    print(f"[i] Train samples: pos={pos_cnt}, neg={neg_cnt} (ratio={neg_cnt / (pos_cnt + 1e-6):.2f})")
+    print(f"Train samples: pos={pos_cnt}, neg={neg_cnt} (ratio={neg_cnt / (pos_cnt + 1e-6):.2f})")
 
     if args.val_dir:
         val_imgs,val_msks=collect_pair(Path(args.val_dir)/'images',Path(args.val_dir)/'masks')
@@ -298,7 +298,7 @@ def train(args):
     model=AttentionASPPUNet(base_c=args.base_c).to(device)
     if args.stage=="finetune":
         load_state_dict_compat(model, args.pretrained)
-        print(f"[i] loaded pretrained {args.pretrained}")
+        print(f"loaded pretrained {args.pretrained}")
 
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=WEIGHT_DECAY)
     tot_ep=args.epochs; warm=0 if args.stage=="finetune" else max(1,int(0.05*tot_ep))
@@ -325,10 +325,10 @@ def train(args):
             scaler.step(opt); scaler.update(); run+=loss.item()
         sch.step()
         d,i=evaluate(model,val_ld,device)
-        print(f"[Val] Dice {d:.4f} | IoU {i:.4f}")
+        print(f"Dice {d:.4f} | IoU {i:.4f}")
         if d>best:
             best=d; noimp=0; torch.save(model.state_dict(),best_p)
-            print(f"[✓] best saved → {best_p}")
+            print(f"best saved → {best_p}")
         else:
             noimp+=1
             if noimp>=EARLY_STOP_PATIENCE: print("Early stop"); break
@@ -407,7 +407,7 @@ def predict(args):
     if thr_cfg.exists():
         try:
             THR = float(json.load(open(thr_cfg))['best_thr'])
-            print(f"[i] use thr {THR:.3f}")
+            print(f"use thr {THR:.3f}")
         except Exception:
             pass
 
@@ -416,9 +416,9 @@ def predict(args):
     if args.spacing_json:
         try:
             spacing_map = json.load(open(args.spacing_json, "r"))
-            print(f"[i] loaded spacing map for PNG ({len(spacing_map)})")
+            print(f"loaded spacing map for PNG ({len(spacing_map)})")
         except Exception as e:
-            print(f"[warn] cannot load spacing_json: {e}")
+            print(f"cannot load spacing_json: {e}")
 
     def _spacing_from_map(case_id: str) -> Tuple[float, float] | None:
         """Extract from JSON (sx, sy). It is compatible with both {'spacing':[sx,sy]} and [sx,sy]."""
@@ -474,11 +474,11 @@ def predict(args):
 
             spacing_xy = _spacing_from_map(case_id)
             if spacing_xy is None:
-                print(f"[warn] no spacing for {case_id}, skip AC")
+                print(f"no spacing for {case_id}, skip AC")
             else:
                 ac_mm = round(measure_ac_mm(mask, spacing_xy), 1)
                 rows.append((case_id, frame_idx, ac_mm))
-                print(f"[✓] {stem}: AC={ac_mm:.1f} mm")
+                print(f"{stem}: AC={ac_mm:.1f} mm")
 
         # ---------------- MHA ----------------
         elif ext == '.mha':
@@ -509,7 +509,7 @@ def predict(args):
             ac_mm = round(measure_ac_mm(bm, (sx, sy)), 1)
             case = p.stem
             rows.append((case, int(bf), ac_mm))
-            print(f"[✓] {case}: best_frame={bf}, AC={ac_mm:.1f} mm")
+            print(f"{case}: best_frame={bf}, AC={ac_mm:.1f} mm")
 
         else:
             continue
@@ -534,7 +534,7 @@ def write_output_mha_and_json(mask,frame,ref,od):
     case=ref.stem; cd=od/case; (cd/'images/fetal-abdomen-segmentation').mkdir(parents=True,exist_ok=True)
     sitk.WriteImage(out_img,str(cd/'images/fetal-abdomen-segmentation/output.mha'))
     json.dump(frame,open(cd/'fetal-abdomen-frame-number.json','w'),indent=2)
-    print(f"[✓] {case} frame {frame}")
+    print(f"{case} frame {frame}")
 
 # ---------- CLI ----------
 def get_args():
