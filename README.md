@@ -1,39 +1,31 @@
-# ACOUSLIC-AI baseline algorithm
-The ACOUSLIC-AI baseline algorithm serves as an initial benchmark for the [ACOUSLIC-AI challenge](https://acouslic-ai.grand-challenge.org/) and a template to assist participants in correctly packaging their own algorithms.
+# ATT-ASPP-UNet for Fetal Abdominal Circumference Estimation
 
-## Managed by
-[Diagnostic Image Analysis Group](https://diagnijmegen.nl/) and [Medical UltraSound Imaging Center](https://music.radboudimaging.nl/), Radboud University Medical Center, Nijmegen, the Netherlands.
+This repository contains the implementation of the **Attention-ASPP-UNet** model for fetal abdominal circumference (AC) estimation from ultrasound images. The project includes full training, evaluation, ablation study, and error analysis pipelines.
 
-## Contact information 
-- Sofía Sappia: mariasofia.sappia@radboudumc.nl
-- Keelin Murphy: keelin.murphy@radboudumc.nl
+A baseline implementation is also provided, used for comparison against the proposed model in terms of segmentation accuracy and AC measurement performance.
 
-## Algorithm
-This algorithm is hosted on [Grand-Challenge](https://grand-challenge.org/algorithms/acouslic-ai-baseline).
+---
 
-### Summary
-This algorithm selects the best frame for measuring the fetal abdominal circumference on a series of blind-sweep d B-mode ultrasound images. Together with this frame, it provides the corresponding fetal abdomen binary segmentation mask. 
+## Code Structure and Descriptions
 
-### Mechanism
-This algorithm is a deep learning-based classification and segmentation model based on the [nnUNet framework](https://github.com/MIC-DKFZ/nnUNet). It was trained for one fold with an 80/20 train/validation split on the ACOUSLIC-AI [Training and Development Dataset](https://doi.org/10.5281/zenodo.11005384). The code to run inference using this baseline method is in `inference.py`. For more details on this algorith, please refer to [An overview of the baseline algorithm](documentation/overview-baseline-algorithm.md).
+| File / Script                        | Description |
+|-------------------------------------|-------------|
+| `attention_aspp_unet_pipeline_stage.py` | Main pipeline for training, post-correction, and inference using the Attention-ASPP-UNet model. |
+| `test_ablation.py`                 | Performs ablation studies to assess the contribution of different model components. |
+| `eval_segmentation_batch.py`       | Computes segmentation performance metrics (e.g., Dice, IoU) for batch predictions. |
+| `analyze_ac.py`                    | Calculates abdominal circumference (AC) and compares it across methods or ground truth. |
+| `vis_error_analysis.py`            | Visualizes and analyzes failure cases to identify typical error patterns. |
+| `convert_to_png.py`                | Converts `.mha` files from the original dataset to `.png` format for preprocessing and model training. The dataset is balanced with a **20% proportion of negative samples**. |
 
-# How to get started?
-### Cloning the repository to your local system
-We recommend that you begin by cloning this repository and packaging it into a Docker container. Once packaged, upload it as a [Grand-Challenge algorithm](https://grand-challenge.org/algorithms/) and submit it to the [Preliminary Development Phase](https://acouslic-ai.grand-challenge.org/evaluation/preliminary-development-phase/submissions/create/) of the challenge. This will help you become acquainted with the platform and ensure you can create a successful submission. Follow these steps to clone the repository to your local system:
-1. Open a new terminal or command window.
-2. Navigate to the location where you want to clone the repository by typing: \
-    ```cd /path/to/your/desired/location```
-3. Clone the repository with the following command: \
-    ```git clone https://github.com/DIAGNijmegen/ACOUSLIC-AI-baseline.git ```
-### Getting started with the algorithm template
-Explore the following resources to understand the baseline algorithm, set up your environment, and begin customizing your own AI solution:
-- **Overview of the baseline algorithm:** Start by reading [this document](documentation/overview-baseline-algorithm.md) to get a detailed understanding of the baseline algorithm provided.
-- **Setting up Docker locally:** Ensure you have Docker configured on your system by following the instructions in [this guide](documentation/setting_up_docker.md).
-- **Building your own AI algorithm:** Learn how to develop and customize your own AI algorithm by reviewing [this document](documentation/building-your-own-ai-algorithm.md).
+---
 
-# Issues
-Please feel free to report any issues you encounter [here](https://github.com/DIAGNijmegen/ACOUSLIC-AI-baseline/issues). 
+## Baseline Code
 
-# License
-This project is licensed under the [LICENSE](LICENSE) file contained in the repository.
+The repository also includes a baseline model implementation used to generate comparative results for segmentation and AC estimation. All evaluation scripts can process both the baseline and proposed model outputs for consistent comparison.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
