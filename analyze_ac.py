@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 Analyze fetal abdominal circumference (AC) predictions vs ground‑truth — *sweep‑aware* version.
-
-Update
-======
-* **Sweep index改为 1‑based**：
-  * GT 侧：`sweep_1_ac_mm → sweep_idx = 1`（不再减 1）
-  * 预测侧：`sweep_idx = frame_idx // FRAMES_PER_SWEEP + 1`
-
-其余逻辑不变。
 """
 
 import argparse
@@ -130,7 +122,7 @@ def main():
     for m,c in zip(["baseline","attention_aspp_unet"],[0.5,0.5]):
         ax.hist(data.query("model==@m")["abs_err"], bins=25, alpha=c, label=m, histtype="stepfilled")
     ax.legend(); fig.savefig(out/"error_hist.png", dpi=300); plt.close(fig)
-    print(f"\nDone. Results in {out.resolve()}")
+    print(f"Done. Results in {out.resolve()}")
 
 if __name__ == "__main__":
     main()

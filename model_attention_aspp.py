@@ -7,7 +7,6 @@ from attention_aspp_unet import AttentionASPPUNet
 
 __all__ = ["FetalAbdomenSegmentation", "select_fetal_abdomen_mask_and_frame"]
 
-# ---------- 读取 + 预处理 ----------
 
 def load_image_file_as_array(*, location: Path):
     img = SimpleITK.ReadImage(str(location))
@@ -17,7 +16,6 @@ def load_image_file_as_array(*, location: Path):
               .astype(np.uint8)), 3) for sl in arr]
     return (np.stack(stack).astype(np.float32) / 255.0)[None]
 
-# ---------- ROI 裁剪 ----------
 
 def crop_roi_224(img):
     h, w = img.shape; thr = img.mean() * 1.2
@@ -31,7 +29,6 @@ def crop_roi_224(img):
                                    224-patch.shape[1], cv2.BORDER_CONSTANT, value=0)
     return patch, (x0, y0)
 
-# ---------- 推理包装 ----------
 
 class FetalAbdomenSegmentation:
     def __init__(self, checkpoint_path="checkpoints/best_model.pth"):
@@ -39,7 +36,7 @@ class FetalAbdomenSegmentation:
         self.net = AttentionASPPUNet(in_ch=1, num_classes=1, base=16).to(self.device)
         miss, unexp = self.net.load_state_dict(torch.load(checkpoint_path, map_location=self.device), strict=False)
         print(f"[DEBUG] load_state — missing:{len(miss)} unexpected:{len(unexp)}")
-        self.net.eval(); print("✅ Weights loaded")
+        self.net.eval(); print("Weights loaded")
 
     @torch.no_grad()
     def predict(self, input_img_path, save_probabilities=False):
@@ -70,8 +67,6 @@ class FetalAbdomenSegmentation:
     # ---------- 后处理 ----------
         # ---------- 后处理 ----------
     def postprocess(self, probability_map):
-        """在 128 帧体积中选择前景面积最大的帧并做简单清噪。完全摆脱对
-        fetal‑abdomen‑frame‑number.json 的依赖，避免所有 case 都写入同一帧。"""
         import scipy.ndimage as ndi
         bin_ = (probability_map > 0.05).astype(np.uint8)         # (N,H,W)
 
@@ -82,7 +77,6 @@ class FetalAbdomenSegmentation:
 
         frame = bin_[frame_idx]
 
-        # ② 膨胀 + 最大连通域（3×3 结构）
         structure = np.ones((3, 3), dtype=np.uint8)
         frame = ndi.binary_dilation(frame, structure=structure, iterations=1)
         labeled, n = ndi.label(frame, structure=structure)
@@ -93,18 +87,6 @@ class FetalAbdomenSegmentation:
         mask = np.zeros_like(bin_, np.uint8);
         mask[frame_idx] = frame
         return mask
-
-        # 膨胀 + 最大连通域（显式 3×3 结构，避免 SciPy 维度报错）
-        structure = np.ones((3, 3), dtype=np.uint8)
-        frame = ndi.binary_dilation(frame, structure=structure, iterations=1)
-        labeled, n = ndi.label(frame, structure=structure)
-        if n:
-            sizes = ndi.sum(frame, labeled, index=range(1, n + 1))
-            frame = (labeled == (np.argmax(sizes) + 1)).astype(np.uint8)
-        mask = np.zeros_like(bin_, np.uint8); mask[frame_idx] = frame
-        return mask
-
-# ---------- 提取最大腹围帧 ----------
 
 def select_fetal_abdomen_mask_and_frame(mask_3d):
     if mask_3d.ndim == 2:

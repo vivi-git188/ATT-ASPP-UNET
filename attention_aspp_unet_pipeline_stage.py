@@ -36,7 +36,7 @@ def set_seed(seed: int = SEED):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    # Albumentations：多版本兼容
+    # Albumentations
     A_set_seed = None
     try:
         from albumentations import set_seed as A_set_seed        # ≥1.3.0
@@ -44,12 +44,12 @@ def set_seed(seed: int = SEED):
         try:
             from albumentations.core.utils import set_seed as A_set_seed  # ≤1.2.x
         except (ImportError, AttributeError):
-            pass                                                # 两处都没有 → 跳过
+            pass
 
     if A_set_seed is not None:
         A_set_seed(seed)
     else:
-        print("[warn] albumentations.set_seed 不存在，已跳过随机种子同步")
+        print("albumentations.set_seed not exist")
 
 def seed_worker(wid):
     s = torch.initial_seed() % 2**32
@@ -286,8 +286,8 @@ def train(args):
         val_imgs = [train_imgs[i] for i in val_idx]
         val_msks = [train_msks[i] for i in val_idx]
 
-        train_ds = FetalACDataset(train_imgs2, train_msks2, train=True)  # 训练＝随机增强（含全部负样本）
-        val_ds = FetalACDataset(val_imgs, val_msks, train=False)  # 验证＝无随机增强（优先正样本）
+        train_ds = FetalACDataset(train_imgs2, train_msks2, train=True)
+        val_ds = FetalACDataset(val_imgs, val_msks, train=False)
 
     g=torch.Generator().manual_seed(args.seed)
     train_ld=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True,
@@ -411,7 +411,7 @@ def predict(args):
         except Exception:
             pass
 
-    # ---- 读取 spacing_json（用于 PNG）----
+    # ---- read spacing_json ----
     spacing_map = {}
     if args.spacing_json:
         try:
@@ -421,7 +421,7 @@ def predict(args):
             print(f"[warn] cannot load spacing_json: {e}")
 
     def _spacing_from_map(case_id: str) -> Tuple[float, float] | None:
-        """从 JSON 抽取 (sx, sy)。既兼容 {'spacing':[sx,sy]} 也兼容 [sx,sy]。"""
+        """Extract from JSON (sx, sy). It is compatible with both {'spacing':[sx,sy]} and [sx,sy]."""
         if case_id not in spacing_map:
             return None
         v = spacing_map[case_id]
@@ -433,7 +433,7 @@ def predict(args):
             return None
         return float(sx), float(sy)
 
-    # ---- 模型 ----
+    # ---- model ----
     model = AttentionASPPUNet(base_c=args.base_c).to(device)
     model.load_state_dict(torch.load(args.weights, map_location=device)); model.eval()
 
@@ -457,11 +457,10 @@ def predict(args):
             prob = cv2.GaussianBlur(prob, (5, 5), 0)
             mask = refine_mask((prob > THR).astype(np.uint8))
 
-            # 保存 mask 图
+            # save mask
             cv2.imwrite(str(od / f"{p.stem}_mask.png"), mask * 255)
 
-            # ---- 计算 AC（需要 spacing_json）----
-            # 取 case_id 与 frame_idx（例如 Case001_s027.png）
+            # ---- calculate AC (spacing_json required)----
             stem = p.stem
             if "_s" in stem:
                 case_id = stem.split("_s")[0]
@@ -475,7 +474,6 @@ def predict(args):
 
             spacing_xy = _spacing_from_map(case_id)
             if spacing_xy is None:
-                # 如果没提供 spacing，就不计算该样本的 AC，但给出提示
                 print(f"[warn] no spacing for {case_id}, skip AC")
             else:
                 ac_mm = round(measure_ac_mm(mask, spacing_xy), 1)
@@ -504,10 +502,8 @@ def predict(args):
             bf = select_best(preds, 5)
             bm = preds[bf]
 
-            # 写 challenge 需要的输出
             write_output_mha_and_json(bm, bf, p, od)
 
-            # ---- 计算 AC（直接用 ITK spacing）----
             # SimpleITK spacing: (sx, sy, sz) 单位 mm
             sx, sy = float(ref_img.GetSpacing()[0]), float(ref_img.GetSpacing()[1])
             ac_mm = round(measure_ac_mm(bm, (sx, sy)), 1)
@@ -518,14 +514,14 @@ def predict(args):
         else:
             continue
 
-    # ---- 写出 CSV 汇总 ----
+    # ---- CSV ----
     if rows:
         csv_path = od / "ac_results.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["case_id", "frame_idx", "ac_mm"])
             w.writerows(rows)
-        print(f"\n[✓] AC 结果已保存 → {csv_path}  (共 {len(rows)} 条)")
+        print(f"\n AC already saved → {csv_path}  (number {len(rows)})")
 
 
 def convert_mask_2d_to_3d(mask,frame,nf):

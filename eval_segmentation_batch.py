@@ -3,17 +3,6 @@
 """
 Evaluate segmentation masks: GT  vs  Baseline  vs  New model
 Metrics: Dice · IoU · HD95 (pixel)
-
-• 终端打印多维度统计 + Wilcoxon 双尾检验
-• 列出 Top-5 / Worst-5 病例
-• 输出 preds_aspp48/seg_eval.csv
-• 可选保存直方图 & 箱线图 (--plot)
-
-Folder layout (默认) ─────────────────────────────────────────
-val_png_best/masks/                 ← ground-truth PNG
-test/output/images/fetal-abdomen-segmentation/**/ *.png   ← baseline
-preds_aspp48/*.png                  ← new model (文件名带 _mask 可改)
-────────────────────────────────────────────────────────────
 """
 
 import argparse, csv, re, statistics as st
@@ -31,24 +20,21 @@ try:
 except ModuleNotFoundError:
     HAS_PLT = False
 
-# ========= 使用者只需改下面 3 个目录（若结构不同） =========
 GT_DIR   = Path("val_png_best_ac/masks")
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")
 NEW_DIR  = Path("preds_panel")
-# 若新模型文件有固定后缀，可写在这里：
-NEW_SUFFIX = "_png"     # 例: abc_mask.png → 去掉 _mask 取 case-id
-# =========================================================
+NEW_SUFFIX = "_png"
 
 OUT_CSV  = NEW_DIR / "seg_eval.csv"
 PLOT_DIR = NEW_DIR / "plots"
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
-# ---------- case-id 提取 ----------
+# ---------- case-id ----------
 ID_RE = re.compile(r"^([0-9a-f-]{36})", re.I)
 def case_id(stem: str) -> str:
     m = ID_RE.match(stem)
     if not m:
-        raise ValueError(f"文件名缺合法 UUID: {stem}")
+        raise ValueError(f"error UUID: {stem}")
     return m.group(1).lower()
 
 # ---------- metrics ----------
@@ -77,7 +63,6 @@ def read_gray(p: Path):
         raise FileNotFoundError(p)
     return img
 
-# ---------- 索引目录 ----------
 def index_dir(root: Path, suffix_strip: str = "") -> dict[str, Path]:
     idx={}
     for p in root.rglob("*"):
@@ -86,7 +71,6 @@ def index_dir(root: Path, suffix_strip: str = "") -> dict[str, Path]:
             idx[cid]=p
     return idx
 
-# ---------- 描述统计 ----------
 def describe(arr):
     arr=[x for x in arr if not isnan(x)]
     return st.mean(arr), st.stdev(arr), st.median(arr), min(arr), max(arr)
@@ -113,7 +97,6 @@ def show_metric(name, new_arr, base_arr, unit="", higher_is_better=True):
     print(f"  Improve ratio: {improve_ratio:.1f}% ({improve_count}/{len(new_arr)})")
     print(f"  Wilcoxon p={p:.4g}  {stars}")
 
-# ---------- 主函数 ----------
 def parse_args():
     ap=argparse.ArgumentParser()
     ap.add_argument("--plot",action="store_true",help="save hist & box plots")
@@ -125,7 +108,7 @@ def main():
     print(BASE_DIR)
     print(NEW_DIR)
     if not (GT_DIR.exists() and BASE_DIR.exists() and NEW_DIR.exists()):
-        raise SystemExit("❌ GT / BASE / NEW 目录不存在，先检查路径")
+        raise SystemExit("GT / BASE / NEW not exist")
 
     gt_idx   = index_dir(GT_DIR)
     base_idx = index_dir(BASE_DIR)
@@ -134,7 +117,7 @@ def main():
     rows=[]
     for cid, gp in gt_idx.items():
         if cid not in base_idx or cid not in new_idx:
-            print(f"[WARN] {cid} 缺预测文件")
+            print(f"{cid} 缺预测文件")
             continue
         gt  = read_gray(gp)
         pb  = read_gray(base_idx[cid])
@@ -148,7 +131,6 @@ def main():
     if not rows:
         raise SystemExit("❌ 无匹配病例，检查文件名或后缀设置")
 
-    # 汇总打印
     dice_n=[r[1] for r in rows]; dice_b=[r[4] for r in rows]
     iou_n =[r[2] for r in rows]; iou_b =[r[5] for r in rows]
     hd_n  =[r[3] for r in rows]; hd_b =[r[6] for r in rows]
@@ -174,12 +156,11 @@ def main():
                     "dice_base","iou_base","hd95_base_px",
                     "dice_diff","iou_diff","hd95_diff"])
         for r in rows: w.writerow(r)
-    print(f"\n[SAVED] {OUT_CSV}")
+    print(f"\n {OUT_CSV}")
 
-    # 绘图
     if args.plot:
         if not HAS_PLT:
-            print("[WARN] matplotlib 未安装，跳过绘图")
+            print("matplotlib 未安装，跳过绘图")
         else:
             PLOT_DIR.mkdir(parents=True,exist_ok=True)
             metrics=[("dice",dice_n,dice_b),
@@ -195,7 +176,7 @@ def main():
                 plt.boxplot([base,new],labels=["Base","New"])
                 plt.title(f"{name.upper()} boxplot"); plt.ylabel(name.upper())
                 plt.savefig(PLOT_DIR/f"{name}_box.png",dpi=200)
-            print(f"[PLOTS] saved to {PLOT_DIR}")
+            print(f"saved to {PLOT_DIR}")
 
 if __name__=="__main__":
     main()
