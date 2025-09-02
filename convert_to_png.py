@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Convert 3D .mha volumes (images + masks) into per-slice PNG pairs **(with per-frame path index)**.
 """
