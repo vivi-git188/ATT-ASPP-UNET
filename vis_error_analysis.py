@@ -127,7 +127,7 @@ def main():
     gt_idx   = index_dir(GT_DIR)
     base_idx = index_dir(BASE_DIR)
     new_idx  = index_dir(NEW_DIR, suffix_strip="_mask")
-    img_idx  = {} if args.no_bg else index_dir(IMG_DIR)   # 底图索引
+    img_idx  = {} if args.no_bg else index_dir(IMG_DIR) 
 
     COL_NEW  = (255, 0,   0)   # blue：New-only
     COL_BASE = (0,   255, 0)   # green：Base-only
