@@ -39,10 +39,10 @@ def set_seed(seed: int = SEED):
     # Albumentations
     A_set_seed = None
     try:
-        from albumentations import set_seed as A_set_seed        # ≥1.3.0
+        from albumentations import set_seed as A_set_seed        
     except (ImportError, AttributeError):
         try:
-            from albumentations.core.utils import set_seed as A_set_seed  # ≤1.2.x
+            from albumentations.core.utils import set_seed as A_set_seed  
         except (ImportError, AttributeError):
             pass
 
@@ -133,7 +133,7 @@ def load_state_dict_compat(model: nn.Module, ckpt_path: str | Path):
     sd = torch.load(ckpt_path, map_location="cpu")
     new_sd = {}
     for k, v in sd.items():
-        nk = k.replace(".W_g.", ".Wg.").replace(".W_x.", ".Wx.")  # 旧→新
+        nk = k.replace(".W_g.", ".Wg.").replace(".W_x.", ".Wx.")  
         new_sd[nk] = v
     missing, unexpected = model.load_state_dict(new_sd, strict=False)
     print(f"[i] loaded with {len(missing)} missing & {len(unexpected)} unexpected keys")
@@ -205,7 +205,6 @@ class EdgeLoss(nn.Module):
         ky = self.ky.to(device=device, dtype=dtype)
         t  = targets.to(device=device, dtype=dtype)
 
-        # ↓ 关键：用关键字 padding=1，且不传 bias ↓
         gx_p = F.conv2d(p, kx, padding=1)
         gy_p = F.conv2d(p, ky, padding=1)
         gx_t = F.conv2d(t, kx, padding=1)
@@ -267,10 +266,8 @@ def train(args):
         train_ds=FetalACDataset(train_imgs,train_msks,True)
         val_ds  =FetalACDataset(val_imgs,val_msks,False)
     else:
-        # 没提供 val_dir：只在“正样本”里切 10% 做验证，负样本全部留在训练
         pos_idx = [i for i, m in enumerate(train_msks) if m is not None]
 
-        # 若没有正样本，回退到“全量里切”，保证 val 非空，避免评估阶段除以 0
         candidate_idx = pos_idx if len(pos_idx) > 0 else list(range(len(train_imgs)))
 
         rng = np.random.default_rng(args.seed)
@@ -402,7 +399,7 @@ def predict(args):
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- 读取全局阈值 ----
+    # ---- Read the global threshold ----
     thr_cfg = Path('./checkpoints/thr.json'); THR = 0.48
     if thr_cfg.exists():
         try:
