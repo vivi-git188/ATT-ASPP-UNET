@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 
-# --------- 路径（与评估脚本保持一致）---------
 GT_DIR   = Path("val_png_best_ac/masks")                    # GT
 BASE_DIR = Path("test/output/images/fetal-abdomen-segmentation")  # baseline 
 NEW_DIR  = Path("preds_finetune")                             
