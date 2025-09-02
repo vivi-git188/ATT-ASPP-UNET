@@ -130,6 +130,7 @@ class AttentionASPPUNet(nn.Module):
 def SafeCLAHE(*a,**k): k.pop("always_apply",None); return CLAHE(*a,**k)
 def SafeMedianBlur(*a,**k): k.pop("always_apply",None); return MedianBlur(*a,**k)
 # ---------- helper: load pretrained with key-renaming ----------
+#It automatically resolves the issue of inconsistent naming when loading the weight files of the old version models (.pt).
 def load_state_dict_compat(model: nn.Module, ckpt_path: str | Path):
     sd = torch.load(ckpt_path, map_location="cpu")
     new_sd = {}
@@ -146,11 +147,10 @@ class FetalACDataset(Dataset):
     def _tfm(self):
         from albumentations import Affine, ElasticTransform
         train_t=[ Resize(IMG_SIZE,IMG_SIZE), HorizontalFlip(0.5),
-            Affine(scale=(0.92,1.08),rotate=(-7,7),translate_percent=(0,0.02),shear=0,p=0.7),
-                  RandomGamma(gamma_limit=(80, 120), p=0.3),
+            Affine(scale=(0.92,1.08),rotate=(-7,7),translate_percent=(0,0.02),shear=0,p=0.7), # Horizontal flip, 50% probability
+                  RandomGamma(gamma_limit=(80, 120), p=0.3),#Grayscale contrast enhancement
                   RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
-
-                  ElasticTransform(8,3,p=0.25), SafeCLAHE(1.0,(8,8)), SafeMedianBlur(3),
+                  ElasticTransform(8,3,p=0.25), SafeCLAHE(1.0,(8,8)), SafeMedianBlur(3), #Median filtering for noise reduction
             ToFloat(max_value=255), ToTensorV2()]
         val_t=[Resize(IMG_SIZE,IMG_SIZE),SafeCLAHE(1.0,(8,8)),SafeMedianBlur(3),
                ToFloat(max_value=255),ToTensorV2()]
@@ -215,6 +215,7 @@ class EdgeLoss(nn.Module):
         grad_t = torch.sqrt(gx_t**2 + gy_t**2 + 1e-8)
         return F.l1_loss(grad_p, grad_t)
 
+#Loss function constructor, used to combine multiple losses (BCE, Dice, Edge) and perform differentiated processing for positive and negative samples
 def build_criterion(args,base,edge):
     def crit(l,t):
         l,t=l.float(),t.float(); B=t.size(0)
@@ -378,7 +379,7 @@ def calibrate(args):
     model=AttentionASPPUNet(base_c=args.base_c).to(device)
     model.load_state_dict(torch.load(args.weights,map_location=device)); model.eval()
     val_dir=Path(args.val_dir); imgs=sorted((val_dir/'images').glob('*.png'))
-    thrs=np.linspace(0.35,0.6,11); scores=[]
+    thrs=np.linspace(0.1,0.9,17); scores=[]
     for thr in tqdm(thrs, desc="Scanning thresholds", unit="thr"):
         ds=[]
         for p in imgs:
