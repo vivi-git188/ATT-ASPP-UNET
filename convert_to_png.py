@@ -2,32 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Convert 3D .mha volumes (images + masks) into per-slice PNG pairs **(with per-frame path index)**.
-
-  • index_dict[case]["frames"] 逐帧记录 {idx, cls, img, mask}
-  • 仍保留 "pos"/"neg" 数组，兼容旧统计脚本
-用法与原脚本保持一致。
-python convert_to_png.py \
-  --mha_root train \
-  --out_root data_png/train \
-  --topk 3 --neighbor_pad 2 \
-  --min_area_mm2 80 --min_area_px 100 \
-  --neg_strategy random --neg_ratio 0.2 \
-  --neg_cap 5 --neg_total_cap 240 \
-  --seed 42
-
-python convert_to_png.py   --mha_root train   --out_root data_png/train   --topk 3 --neighbor_pad 1   --min_area_mm2 80 --min_area_px 100   --neg_strategy random --neg_ratio 0.2   --neg_cap 5 --neg_total_cap 240   --seed 42
 """
 import csv
 from pathlib import Path
 import argparse, json, cv2, imageio, numpy as np, SimpleITK as sitk
 from tqdm import tqdm
 
-# ---------- 工具函数保持不变 ----------
-# ---------- 工具函数实现 ----------
 def get_xy_spacing_mm(img_sitk):
     """
-    读取 SimpleITK 图像的像素间距 (sx, sy) ，单位 mm。
-    若 spacing 信息缺失或异常，则返回 None。
+    Read the pixel spacing (sx, sy) of the SimpleITK image, with units in mm. If the spacing information is missing or abnormal, return None.
     """
     try:
         sx, sy, *_ = img_sitk.GetSpacing()          # SITK 顺序 (sx, sy, sz)
@@ -37,10 +20,6 @@ def get_xy_spacing_mm(img_sitk):
 
 
 def normalize_slice_to_u8(sl: np.ndarray):
-    """
-    把单帧 (H,W) 数组拉伸到 0–255 uint8。
-    采用 1–99 百分位裁剪，减少极值影响。
-    """
     sl = sl.astype(np.float32)
     p1, p99 = np.percentile(sl, (1, 99))
     if p99 - p1 < 1e-5:                            # 全黑/全白
@@ -52,9 +31,7 @@ def normalize_slice_to_u8(sl: np.ndarray):
 
 def decide_threshold_px(min_area_mm2, min_area_px, sx_sy_mm):
     """
-    计算“前景面积阈值”的像素数。
-    • 若同时提供 mm² 阈值和 spacing，则 mm² → px 后与 min_area_px 取较大；
-    • 否则直接使用 min_area_px。
+   Calculate the number of pixels of the "prospective area threshold".
     """
     thr_px = int(max(1, min_area_px))
     if min_area_mm2 and sx_sy_mm:
@@ -64,7 +41,6 @@ def decide_threshold_px(min_area_mm2, min_area_px, sx_sy_mm):
     return thr_px
 
 
-# ---------- 主转换函数 ----------
 def convert_frames_with_negatives(
     mha_root: str,
     out_root: str,
@@ -97,7 +73,7 @@ def convert_frames_with_negatives(
         name = f_img.stem
         f_msk = mha_root / "masks" / f"{name}.mha"
         if not f_msk.exists():
-            print(f"⚠️ 掩码缺失: {name}，跳过")
+            print(f"loss code---skip")
             continue
 
         img_itk = sitk.ReadImage(str(f_img))
@@ -108,12 +84,10 @@ def convert_frames_with_negatives(
 
         sx_sy = get_xy_spacing_mm(img_itk) or get_xy_spacing_mm(msk_itk)
         if sx_sy is None:
-            # 当 MHA 头信息缺少 spacing 时，用 1.0mm 兜底（等价像素阈值≈面积阈值）
             sx_sy = (1.0, 1.0)
 
         thr_px = decide_threshold_px(min_area_mm2, min_area_px, sx_sy)
 
-        # 兜底：如果 decide_threshold_px 仍然返回 None，则回落到 min_area_px（再不行就 0）
         if thr_px is None:
             thr_px = int(min_area_px if min_area_px is not None else 0)
 
@@ -122,7 +96,6 @@ def convert_frames_with_negatives(
         pos_pool = np.where(is_pos)[0]
         neg_pool = np.where(~is_pos)[0]
 
-        # ---- 选正样本 ----
         pos_idxs = np.array([], dtype=int)
         if not export_neg_only and pos_pool.size and topk > 0:
             order = np.argsort(areas_px[pos_pool])[::-1]
@@ -136,7 +109,6 @@ def convert_frames_with_negatives(
             else:
                 pos_idxs = np.unique(top)
 
-        # ---- 选负样本 ----
         neg_idxs = np.array([], dtype=int)
         if neg_pool.size:
             if neg_strategy == "all":
@@ -149,7 +121,6 @@ def convert_frames_with_negatives(
             elif neg_strategy == "stride":
                 neg_idxs = neg_pool[::max(1, neg_stride)][:neg_cap]
 
-        # ---- 全局负样本 cap ----
         if neg_total_cap > 0:
             remain = neg_total_cap - neg_total_saved
             if remain <= 0:
@@ -159,7 +130,6 @@ def convert_frames_with_negatives(
 
         saved_pos, saved_neg, saved_frames = [], [], []        # ← NEW
 
-        # ---- 保存正样本 ----
         for idx in pos_idxs:
             sl   = img3d[idx]; msk = (msk3d[idx] > 0).astype(np.uint8)
             sl_u8 = normalize_slice_to_u8(sl); msk_u8 = (msk*255).astype(np.uint8)
@@ -171,7 +141,6 @@ def convert_frames_with_negatives(
             saved_frames.append({"idx": int(idx), "cls": "pos",
                                  "img": f"images/{fname}", "mask": f"masks/{fname}"})
 
-        # ---- 保存负样本 ----
         for idx in neg_idxs:
             sl_u8 = normalize_slice_to_u8(img3d[idx])
             fname = f"{name}_s{idx:03d}.png"
@@ -188,7 +157,7 @@ def convert_frames_with_negatives(
             index_dict[name] = {
                 "pos": sorted(saved_pos),
                 "neg": sorted(saved_neg),
-                "frames": saved_frames,                    # ← NEW
+                "frames": saved_frames,                   
                 "_meta": {
                     "thr_px": int(thr_px),
                     "spacing_xy_mm": None if sx_sy is None else [float(sx_sy[0]), float(sx_sy[1])],
@@ -196,7 +165,6 @@ def convert_frames_with_negatives(
                 }
             }
 
-    # ---- 写索引 ----
     (out_msk / "frame_indices.json").write_text(
         json.dumps(index_dict, indent=2, ensure_ascii=False)
     )
@@ -209,10 +177,7 @@ def convert_frames_with_negatives(
                 w.writerow([case_id,
                             fr["idx"]])
 
-    print(f"✅ 导出完毕，共保存 {len(index_dict)} 例；负样本 {neg_total_saved} 张")
 
-
-# ---------- 其余函数（argparse + presets）保持不变 ----------
 def build_argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mha_root", type=str, required=True, help="输入 MHA 根目录（包含 images/ 和 masks/）")
@@ -232,7 +197,6 @@ def build_argparser():
     return parser
 
 def apply_stage_presets(args):
-    # 如果以后想加 stage 预设，可以在这里修改 args
     return args
 
 
