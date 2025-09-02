@@ -12,7 +12,7 @@ def get_xy_spacing_mm(img_sitk):
     Read the pixel spacing (sx, sy) of the SimpleITK image, with units in mm. If the spacing information is missing or abnormal, return None.
     """
     try:
-        sx, sy, *_ = img_sitk.GetSpacing()          # SITK 顺序 (sx, sy, sz)
+        sx, sy, *_ = img_sitk.GetSpacing()          # SITK order (sx, sy, sz)
         return (float(sx), float(sy)) if sx > 0 and sy > 0 else None
     except Exception:
         return None
@@ -21,7 +21,7 @@ def get_xy_spacing_mm(img_sitk):
 def normalize_slice_to_u8(sl: np.ndarray):
     sl = sl.astype(np.float32)
     p1, p99 = np.percentile(sl, (1, 99))
-    if p99 - p1 < 1e-5:                            # 全黑/全白
+    if p99 - p1 < 1e-5:                      
         return np.zeros_like(sl, np.uint8)
     sl = np.clip(sl, p1, p99)
     sl = (sl - p1) / (p99 - p1 + 1e-5)
@@ -63,7 +63,7 @@ def convert_frames_with_negatives(
     out_msk = Path(out_root, "masks");  out_msk.mkdir(parents=True, exist_ok=True)
 
     image_files = list((mha_root / "images").glob("*.mha"))
-    image_files = list(rng.permutation(image_files))  # 打乱顺序方便全局 cap
+    image_files = list(rng.permutation(image_files))  
 
     index_dict: dict[str, dict] = {}
     neg_total_saved = 0
@@ -127,7 +127,7 @@ def convert_frames_with_negatives(
             elif len(neg_idxs) > remain:
                 neg_idxs = rng.choice(neg_idxs, remain, replace=False)
 
-        saved_pos, saved_neg, saved_frames = [], [], []        # ← NEW
+        saved_pos, saved_neg, saved_frames = [], [], []        
 
         for idx in pos_idxs:
             sl   = img3d[idx]; msk = (msk3d[idx] > 0).astype(np.uint8)
@@ -179,8 +179,8 @@ def convert_frames_with_negatives(
 
 def build_argparser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mha_root", type=str, required=True, help="输入 MHA 根目录（包含 images/ 和 masks/）")
-    parser.add_argument("--out_root", type=str, required=True, help="输出 PNG 根目录")
+    parser.add_argument("--mha_root", type=str, required=True")
+    parser.add_argument("--out_root", type=str, required=True")
 
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--neighbor_pad", type=int, default=0)
