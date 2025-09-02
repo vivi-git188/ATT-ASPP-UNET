@@ -91,6 +91,7 @@ class AttentionGate(nn.Module):
         self.relu=nn.ReLU(True)
     def forward(self,g,x): return x * self.psi(self.relu(self.Wg(g)+self.Wx(x)))
 
+#Placeholder module, used to replace the actual Attention Gate when disabling the attention mechanism of certain layers
 class DummyAttention(nn.Module):
     def forward(self,g,x): return x
 
