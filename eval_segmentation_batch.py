@@ -79,7 +79,7 @@ def show_metric(name, new_arr, base_arr, unit="", higher_is_better=True):
     mn, sn, mdn, minn, maxn = describe(new_arr)
     mb, sb, mdb, minb, maxb = describe(base_arr)
     cmp = (np.array(new_arr) > np.array(base_arr)) if higher_is_better \
-        else (np.array(new_arr) < np.array(base_arr))  # HD95 用 <
+        else (np.array(new_arr) < np.array(base_arr))  
     improve_count = int(cmp.sum())
     improve_ratio = 100.0 * improve_count / len(new_arr)
 
@@ -129,7 +129,7 @@ def main():
                      d_n-d_b,i_n-i_b,h_n-h_b))
 
     if not rows:
-        raise SystemExit("❌ 无匹配病例，检查文件名或后缀设置")
+        raise SystemExit("No matching cases, check the file name or suffix settings")
 
     dice_n=[r[1] for r in rows]; dice_b=[r[4] for r in rows]
     iou_n =[r[2] for r in rows]; iou_b =[r[5] for r in rows]
@@ -160,7 +160,7 @@ def main():
 
     if args.plot:
         if not HAS_PLT:
-            print("matplotlib 未安装，跳过绘图")
+            print("matplotlib is not installed, skipping the plotting.")
         else:
             PLOT_DIR.mkdir(parents=True,exist_ok=True)
             metrics=[("dice",dice_n,dice_b),
